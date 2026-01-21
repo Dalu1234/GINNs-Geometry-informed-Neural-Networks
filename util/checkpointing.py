@@ -82,7 +82,7 @@ def save_model_every_n_epochs(model, optim, sched, config, epoch):
                 yaml.dump(config, file)
 
     model_parent_path = config['save_model_dir']
-    name_stem = model_parent_path.split('/')[-1]
+    name_stem = os.path.basename(model_parent_path)  # Cross-platform path handling
 
     ## add epoch to filename if not overwriting
     if not config['overwrite_existing_saved_model']:

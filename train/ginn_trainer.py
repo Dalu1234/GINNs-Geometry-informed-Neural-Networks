@@ -28,6 +28,8 @@ from train.train_utils.latent_sampler import LatentSampler
 from util.checkpointing import load_model_optim_sched, save_model_every_n_epochs
 from util.misc import combine_dicts, do_plot, get_model, get_problem, is_every_n_epochs_fulfilled
 from train.losses_ginn import *
+from train.losses_diversity import diversity_loss_chamfer, diversity_loss_contrastive, diversity_loss_volume_symmetric_difference, diversity_loss_combined
+from train.losses_connectivity_v2 import CachedConnectivityLossV2 as CachedConnectivityLoss
 from train.train_utils.loss_calculator_alm import AdaptiveAugmentedLagrangianLoss
 
 
@@ -99,6 +101,20 @@ class Trainer():
         self.cur_plot_epoch = 0
         self.log_history_dict = {}
         
+        # Connectivity loss (Morse theory V2) for generative training
+        # V2 improvements: near-surface filtering, clamped Newton steps
+        self.cached_connectivity_loss = None
+        if self.config.get('lambda_connectivity', 0) > 0:
+            self.cached_connectivity_loss = CachedConnectivityLoss(
+                bounds=self.problem.bounds,
+                n_samples=self.config.get('connectivity_n_samples', 1000),
+                n_iter=self.config.get('connectivity_n_iter', 30),
+                grad_tol=self.config.get('connectivity_grad_tol', 1e-2),
+                update_every_n_epochs=self.config.get('connectivity_update_every_n_epochs', 50),
+                near_surface_threshold=self.config.get('connectivity_near_surface_threshold', 0.15),
+                max_step_size=self.config.get('connectivity_max_step_size', 0.3),
+            )
+        
         # loss balancing
         self.scalar_loss_keys, self.field_loss_keys, lambda_dict, objective_key = get_loss_keys_and_lambdas(self.config)
         self.all_loss_keys = self.scalar_loss_keys + self.field_loss_keys
@@ -125,7 +141,12 @@ class Trainer():
         
         # get z
         z = self.z_sampler.train_z()
-        z_corners = self.z_sampler.get_z_corners(len(self.config['data'].get('simjeb_ids', [])))
+        # In generative mode, don't use corner anchors - pure random sampling
+        if self.config.get('training_mode', 'single') == 'generative':
+            z_corners = torch.zeros(0, z.shape[1])  # empty tensor with correct nz
+            self.logger.info('Generative mode: z will be resampled every batch')
+        else:
+            z_corners = self.z_sampler.get_z_corners(len(self.config['data'].get('simjeb_ids', [])))
         z_val = self.z_sampler.val_z()
         self.logger.info(f'Initial z (resampling: {self.config["latent_sampling"]["z_sample_method"]}): {z}')        
         self.logger.info(f'z_corners (not resampled): {z_corners}')
@@ -160,7 +181,10 @@ class Trainer():
 
             ## training
             self.model.train()
-            if epoch > 0 and is_every_n_epochs_fulfilled(epoch, self.config, 'reset_zlatents_every_n_epochs'):
+            # In generative mode, resample z every batch for world model training
+            if self.config.get('training_mode', 'single') == 'generative':
+                z = self.z_sampler.train_z()
+            elif epoch > 0 and is_every_n_epochs_fulfilled(epoch, self.config, 'reset_zlatents_every_n_epochs'):
                 z = self.z_sampler.train_z()
             # only plot the GINN points in the first epoch, as they are memory-intensive
             # if self.feni.constraint_to_pts_dict if epoch > 0 else combine_dicts([self.feni.constraint_to_pts_dict, self.problem.constr_pts_dict])
@@ -403,7 +427,19 @@ class Trainer():
                                    max_div=self.config['max_div'], chamfer_div_eps=self.config.get('chamfer_div_eps', 1e-6), 
                                    loss_scale=self.config.get('scale_chamfer_div', 1), subsample=self.config.get('chamfer_div_subsample', None)),
             
+            # New diversity losses for generative training
+            'shape_diversity': partial(loss_shape_diversity, 
+                                       diversity_type=self.config.get('diversity_type', 'chamfer'),
+                                       aggregation=self.config.get('diversity_aggregation', 'min'),
+                                       max_diversity=self.config.get('max_diversity', None),
+                                       loss_scale=self.config.get('scale_shape_diversity', 1.0)),
             
+            # Connectivity loss (Morse theory) for generative training
+            'connectivity': partial(loss_connectivity,
+                                    netp=self.netp,
+                                    bounds=self.problem.bounds,
+                                    cached_connectivity_loss=self.cached_connectivity_loss,
+                                    loss_scale=self.config.get('scale_connectivity', 1.0)),
            
             # data losses
             'lip': partial(loss_lip, netp=self.netp),

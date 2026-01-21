@@ -122,6 +122,25 @@ div_norm_order: 1
 div_neighbor_agg_fn: 'min'  # mean, sum, min, leinster
 exclude_surface_points_close_to_interface_cutoff: 0.025  # 0.0 means no interface points are excluded
 
+# Shape diversity for generative training (maximizes dissimilarity between shapes)
+lambda_shape_diversity: 0  # set > 0 to enable
+diversity_type: 'chamfer'  # 'chamfer', 'volume', 'contrastive'
+diversity_aggregation: 'min'  # 'min' (robust) or 'mean'
+max_diversity: null  # optional threshold above which loss is 0
+scale_shape_diversity: 1.0
+
+###################
+## CONNECTIVITY (Morse Theory)
+###################
+# Encourages single connected component via saddle point penalization
+lambda_connectivity: 0  # set > 0 to enable (expensive!)
+connectivity_n_samples: 1000  # starting points for critical point search
+connectivity_n_iter: 30  # Newton iterations
+connectivity_grad_tol: 0.01  # gradient norm threshold for convergence
+connectivity_update_every_n_epochs: 50  # cache update frequency
+scale_connectivity: 1.0
+start_connectivity: 1000  # epoch to start connectivity loss (let shape form first)
+
 ###################
 ## Metrics computation
 ###################
@@ -139,7 +158,7 @@ metrics:
 ## LOGGING
 ###################
 log_level: 'INFO'
-wandb_entity_name: 'abra'
+wandb_entity_name: 'daludk-star-labs'
 wandb_project_name: "topginn"
 plot:
   fig_size: [12, 7]
@@ -172,6 +191,9 @@ problem:
 ###################
 ## Training
 ###################
+# training_mode: 'single' optimizes a fixed set of z latents (original GINN)
+# training_mode: 'generative' samples new random z every batch for world model training
+training_mode: 'single'
 seed: 11
 ## Outer optimization loop
 lr: 0.001

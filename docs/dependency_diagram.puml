@@ -1,0 +1,43 @@
+@startuml
+skinparam linetype ortho
+
+package "Core Modules" {
+  [data] --> [evaluation]
+  [evaluation] --> [models]
+  [models] --> [train]
+  [train] --> [util]
+}
+
+package "Configurations" {
+  [configs/GINN]
+  [configs/TOM]
+}
+
+package "Checkpoints" {
+  [GINN-model.pt]
+  [GINN-config.yml]
+}
+
+package "External Libraries" {
+  [deepsdf]
+  [deflatedbarrier_repo]
+  [mesh_to_sdf]
+}
+
+package "Notebooks" {
+  [GINN_from_checkpoint.ipynb]
+  [minimal_surface.ipynb]
+}
+
+package "Utilities" {
+  [checkpointing.py]
+  [vis_utils.py]
+}
+
+[run.py] --> [Core Modules]
+[Core Modules] --> [Configurations]
+[Core Modules] --> [Checkpoints]
+[Core Modules] --> [External Libraries]
+[Core Modules] --> [Utilities]
+
+@enduml
