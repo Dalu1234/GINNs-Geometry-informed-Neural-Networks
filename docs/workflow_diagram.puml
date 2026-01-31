@@ -1,0 +1,18 @@
+@startuml
+start
+:Load Configuration;
+:Initialize Model;
+:Load Dataset;
+
+if (Pre-trained Checkpoint?) then (Yes)
+  :Load Checkpoint;
+else (No)
+  :Initialize Weights;
+endif
+
+:Train Model;
+:Evaluate Model;
+:Save Checkpoint;
+:Visualize Results;
+stop
+@enduml

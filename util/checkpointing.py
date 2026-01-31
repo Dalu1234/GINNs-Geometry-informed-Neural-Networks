@@ -82,7 +82,7 @@ def save_model_every_n_epochs(model, optim, sched, config, epoch):
                 yaml.dump(config, file)
 
     model_parent_path = config['save_model_dir']
-    name_stem = model_parent_path.split('/')[-1]
+    name_stem = os.path.basename(model_parent_path)  # Cross-platform path handling
 
     ## add epoch to filename if not overwriting
     if not config['overwrite_existing_saved_model']:
@@ -121,7 +121,10 @@ def get_model_path_via_wandb_id_from_fs(run_id, root_dir, use_epoch=None, get_fi
     raise ValueError(f"Could not find model with {run_id=} anywhere")
 
 
-def load_model_optim_sched(config, model, optim, sched, device='cuda'):
+def load_model_optim_sched(config, model, optim, sched, device=None):
+    ## Auto-detect device if not specified
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     ## Load model weights
     if not (config.get('load_model', False) or config.get('load_mos', False)):
         if 'model_load_path' in config or 'model_load_wandb_id' in config:

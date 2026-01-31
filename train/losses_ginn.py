@@ -15,8 +15,8 @@ from models.point_wrapper import PointWrapper
 from util.model_utils import tensor_product_xz
 from train.losses import CD_dCDdy_loss, chamfer_diversity_loss, diversity_loss, dirichlet_loss, envelope_loss_density, expression_curvature_loss, interface_loss, eikonal_loss, envelope_loss_sdf, l1_loss, mse_loss, normal_loss_euclidean, wasserstein_diversity_loss
 
-type Scalar = torch.Tensor #TODO: need to implement this more rigorously using torchtypeing https://github.com/patrick-kidger/torchtyping
-type Grad_Field = torch.Tensor
+Scalar: typing.TypeAlias = torch.Tensor #TODO: need to implement this more rigorously using torchtypeing https://github.com/patrick-kidger/torchtyping
+Grad_Field: typing.TypeAlias = torch.Tensor
 
 def loss_eikonal(z, p_sampler, netp, scale_eikonal, **kwargs) -> Scalar:
     loss_eikonal = torch.tensor(0.0, device=z.device, dtype=z.dtype)
@@ -334,3 +334,109 @@ def loss_volume(z, netp: NetWithPartials, p_sampler, vol_frac, x_fem, beta, p, p
     V_loss = loss_scale * V_loss.mean()
     V_loss = V_loss ** 2 # square the loss to compensate for the square root in the ALM
     return V_loss
+
+
+# =============================================================================
+# Shape Diversity Loss (for generative training)
+# =============================================================================
+
+def loss_shape_diversity(z, p_surface, diversity_type, aggregation, max_diversity, loss_scale, **kwargs) -> Scalar:
+    """
+    Wrapper for diversity losses that matches the standard loss signature.
+    
+    Encourages generated shapes to be different from each other.
+    
+    Args:
+        z: Latent vectors [B, nz]
+        p_surface: PointWrapper with surface points for all shapes
+        diversity_type: 'chamfer', 'volume', or 'contrastive'
+        aggregation: 'min' or 'mean'
+        max_diversity: Optional threshold above which loss is 0
+        loss_scale: Scaling factor for the loss
+        
+    Returns:
+        Scalar diversity loss
+    """
+    from train.losses_diversity import (
+        diversity_loss_chamfer,
+        diversity_loss_volume_symmetric_difference,
+        diversity_loss_contrastive,
+    )
+    
+    loss = torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    
+    if p_surface is None:
+        return loss
+    
+    if diversity_type == 'chamfer':
+        loss = diversity_loss_chamfer(
+            surface_pts_batch=p_surface,
+            aggregation=aggregation,
+            max_diversity=max_diversity,
+        )
+    elif diversity_type == 'volume':
+        # Volume-based diversity requires SDF grid - not available here
+        # This would be computed from the FEM grid if needed
+        pass
+    elif diversity_type == 'contrastive':
+        # Contrastive loss requires shape features
+        # Could use flattened surface point statistics
+        pass
+    
+    loss = loss_scale * loss
+    return loss
+
+
+# =============================================================================
+# Connectivity Loss (Morse Theory - for generative training)
+# =============================================================================
+
+def loss_connectivity(
+    z, 
+    netp, 
+    bounds,
+    cached_connectivity_loss,
+    epoch,
+    loss_scale,
+    **kwargs
+) -> Scalar:
+    """
+    Wrapper for connectivity loss that matches the standard loss signature.
+    
+    Uses Morse theory to find index-1 saddle points and penalizes them
+    if f(saddle) ≠ 0, encouraging connected level sets.
+    
+    Args:
+        z: Latent vectors [B, nz]
+        netp: NetWithPartials model wrapper
+        bounds: [D, 2] bounding box
+        cached_connectivity_loss: CachedConnectivityLoss instance for efficiency
+        epoch: Current training epoch
+        loss_scale: Scaling factor
+        
+    Returns:
+        Scalar connectivity loss (averaged over batch)
+    """
+    from train.losses_connectivity_v2 import CachedConnectivityLossV2 as CachedConnectivityLoss
+    
+    loss_total = torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    n_shapes = z.shape[0]
+    
+    # Process each shape in batch
+    # Note: This is expensive - consider only computing for subset of batch
+    for i in range(min(n_shapes, 4)):  # Limit to 4 shapes for efficiency
+        z_i = z[i:i+1]  # [1, nz]
+        
+        # Create callable for this shape
+        def f_i(x):
+            z_expanded = z_i.expand(len(x), -1)
+            return netp(x, z_expanded)
+        
+        loss_i, info = cached_connectivity_loss(f_i, epoch)
+        loss_total = loss_total + loss_i
+    
+    # Average over shapes processed
+    loss_total = loss_total / min(n_shapes, 4)
+    loss_total = loss_scale * loss_total
+    
+    return loss_total

@@ -1,0 +1,65 @@
+{
+  "timestamp": "2026-01-28T14:10:40.914544",
+  "config": {
+    "n_pairs": 5,
+    "n_steps": 10,
+    "resolution": 48,
+    "nz": 2
+  },
+  "aggregate": {
+    "avg_validity": 1.0,
+    "avg_connectivity": 0.0,
+    "total_holes": 0,
+    "avg_smoothness": 0.046343026649191675,
+    "max_smoothness": 0.07260534474498259,
+    "avg_volume_cv": 0.3133193140686497,
+    "overall_pass": false
+  },
+  "per_pair": [
+    {
+      "pair_idx": 0,
+      "validity_rate": 1.0,
+      "connected_rate": 0.0,
+      "n_holes": 0,
+      "avg_smoothness": 0.046939652587042316,
+      "max_smoothness": 0.05016279714628377,
+      "volume_cv": 0.20940066925513431
+    },
+    {
+      "pair_idx": 1,
+      "validity_rate": 1.0,
+      "connected_rate": 0.0,
+      "n_holes": 0,
+      "avg_smoothness": 0.044763093484630166,
+      "max_smoothness": 0.04670487327025187,
+      "volume_cv": 0.10711625006938438
+    },
+    {
+      "pair_idx": 2,
+      "validity_rate": 1.0,
+      "connected_rate": 0.0,
+      "n_holes": 0,
+      "avg_smoothness": 0.05499987968433487,
+      "max_smoothness": 0.07260534474498259,
+      "volume_cv": 0.5088717685678421
+    },
+    {
+      "pair_idx": 3,
+      "validity_rate": 1.0,
+      "connected_rate": 0.0,
+      "n_holes": 0,
+      "avg_smoothness": 0.026147810424472232,
+      "max_smoothness": 0.04779021009768153,
+      "volume_cv": 0.32066722913333384
+    },
+    {
+      "pair_idx": 4,
+      "validity_rate": 1.0,
+      "connected_rate": 0.0,
+      "n_holes": 0,
+      "avg_smoothness": 0.058864697065478824,
+      "max_smoothness": 0.06978552281284127,
+      "volume_cv": 0.4205406533175537
+    }
+  ]
+}

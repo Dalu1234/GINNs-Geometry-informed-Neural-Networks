@@ -40,7 +40,16 @@ class NumericalBoundaryHelper:
         self.bin_search_steps = bin_search_steps
         
         self.logger = logging.getLogger('surf_pts_helper')
+        self.equidistant_init_grid = equidistant_init_grid
         self.grid_find_surface, self.grid_dist_find_surface, self.init_grid_resolution = precompute_sample_grid(self.surf_pts_nof_points, self.bounds, equidistant=equidistant_init_grid)
+
+    def set_problem(self, problem):
+        """Update bounds and interface from problem (e.g. when switching N for LEGO 1xN)."""
+        self.bounds = problem.bounds
+        self.x_interface = problem.sample_from_interface()[0]
+        self.grid_find_surface, self.grid_dist_find_surface, self.init_grid_resolution = precompute_sample_grid(
+            self.surf_pts_nof_points, self.bounds, equidistant=self.equidistant_init_grid
+        )
         
     def get_surface_pts(self, z, interface_cutoff, plot, plot_max_shapes=None):
         with Timer.record('get_surface_pts'):
@@ -67,18 +76,24 @@ class NumericalBoundaryHelper:
             p_surface_plot = p_surface.select_w_shapes(incl_shapes=np.arange(min(len(z), plot_max_shapes)))
             z_plot = z[:min(len(z), plot_max_shapes)]
 
-            y_x_surf = self.netp.grouped_no_grad_fwd('vf_x', p_surface_plot.data, p_surface_plot.z_in(z_plot)).squeeze(1)
-            y_xx_surf = self.netp.grouped_no_grad_fwd('vf_xx', p_surface_plot.data, p_surface_plot.z_in(z_plot)).squeeze(1)
-            
-            mean_curvatures = get_mean_curvature_normalized(y_x_surf, y_xx_surf)
-            gauss_curvatures = get_gauss_curvature(y_x_surf, y_xx_surf)
-            E_strain = (2*mean_curvatures)**2 - 2*gauss_curvatures
+            # Guard against empty surface points
+            if p_surface_plot.data is not None and len(p_surface_plot.data) > 0:
+                y_x_surf = self.netp.grouped_no_grad_fwd('vf_x', p_surface_plot.data, p_surface_plot.z_in(z_plot))
+                y_xx_surf = self.netp.grouped_no_grad_fwd('vf_xx', p_surface_plot.data, p_surface_plot.z_in(z_plot))
+                
+                if y_x_surf is not None and y_xx_surf is not None:
+                    y_x_surf = y_x_surf.squeeze(1)
+                    y_xx_surf = y_xx_surf.squeeze(1)
+                    
+                    mean_curvatures = get_mean_curvature_normalized(y_x_surf, y_xx_surf)
+                    gauss_curvatures = get_gauss_curvature(y_x_surf, y_xx_surf)
+                    E_strain = (2*mean_curvatures)**2 - 2*gauss_curvatures
 
-            self.mpm.plot(self.plotter.plot_shape_and_points, 'plot_surface_points',
-                    arg_list=[p_surface_plot.detach().cpu().numpy(), 'Surface points interface cutoff'], kwargs_dict=dict(point_attribute=(10*(dist > interface_cutoff)).detach().cpu().numpy()))
+                    self.mpm.plot(self.plotter.plot_shape_and_points, 'plot_surface_points',
+                            arg_list=[p_surface_plot.detach().cpu().numpy(), 'Surface points interface cutoff'], kwargs_dict=dict(point_attribute=(10*(dist > interface_cutoff)).detach().cpu().numpy()))
 
-            self.mpm.plot(self.plotter.plot_shape_and_points, 'plot_surface_points', 
-                                    arg_list=[p_surface_plot.detach().cpu().numpy(), 'Weighted Surface points'], kwargs_dict=dict(point_attribute=(torch.log10(E_strain + 1)).detach().cpu().numpy()))
+                    self.mpm.plot(self.plotter.plot_shape_and_points, 'plot_surface_points', 
+                                            arg_list=[p_surface_plot.detach().cpu().numpy(), 'Weighted Surface points'], kwargs_dict=dict(point_attribute=(torch.log10(E_strain + 1)).detach().cpu().numpy()))
         
         weights_surf_pts = torch.ones(len(p_surface)) / p_surface.data.shape[0]
         if interface_cutoff > 0:

@@ -89,6 +89,9 @@ def get_problem(problem_config, **kwargs):
     elif problem_config['problem_str'] == 'simjeb':
         from GINN.problems.problem_simjeb import ProblemSimjeb
         return ProblemSimjeb(**problem_config, **kwargs)
+    elif problem_config['problem_str'] == 'lego_1xN':
+        from GINN.problems.problem_lego_1xN import ProblemLego1xN
+        return ProblemLego1xN(**problem_config, **kwargs)
     else:
         raise ValueError(f'Unknown problem type: {problem_config["problem_str"]}')
 

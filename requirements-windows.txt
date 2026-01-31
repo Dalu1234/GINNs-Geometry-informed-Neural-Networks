@@ -1,0 +1,55 @@
+# Core dependencies for GINN on Windows
+torch>=2.0.0
+torchvision
+torchaudio
+
+# Scientific computing
+numpy>=1.24.0,<2.0
+scipy
+matplotlib
+scikit-learn
+
+# Neural network / deep learning
+einops
+wandb
+
+# Config and utilities
+pyyaml
+kappaconfig
+click
+tqdm
+dill
+
+# Mesh and geometry
+trimesh
+pyvista
+fast_simplification
+manifold3d
+
+# Visualization
+k3d
+ipywidgets
+plotly
+
+# Jupyter
+ipykernel
+ipython
+jupyter_client
+jupyter_core
+nbformat
+nbconvert
+
+# Image processing
+imageio
+pillow
+
+# Persistent homology (optional - may need special install)
+# cripser==0.0.13
+
+# Other utilities
+GitPython
+beautifulsoup4
+requests
+pandas
+networkx
+joblib

@@ -1,0 +1,103 @@
+# Generative Base Config
+# This config enables "world model" training mode where the network learns
+# to generate diverse valid structures across the latent space rather than
+# optimizing a single fixed shape.
+#
+# Key differences from single-shape training:
+# - training_mode: 'generative' - resamples z every batch
+# - z_sample_method: 'uniform' - random sampling (not equidistant grid)
+# - No data anchors (z_corners) - purely constraint-driven
+# - Larger latent batch size for diversity
+
+###################
+## Training Mode
+###################
+training_mode: 'generative'
+
+###################
+## Latent Sampling
+###################
+latent_sampling:
+  nz: 8  # latent dimension - higher for more shape variety
+  ginn_bsize: 16  # batch size of z vectors per step
+  z_sample_method: 'uniform'  # random uniform sampling
+  z_sample_interval: [-1, 1]
+  val_plot_grid: [4, 4]  # for visualization
+
+###################
+## Model
+###################
+model:
+  ny: 1
+  w0: 1.0
+  use_density: False
+  density_iso_level: 0.05
+  group_size_fwd_no_grad: ${eval:2*1024*1024}
+
+###################
+## Losses - GINN geometric constraints
+###################
+# These ensure valid structures without data supervision
+field_losses: []
+lambda_env: 1.0       # envelope constraint
+lambda_obst: 1.0      # obstacle avoidance
+lambda_if: 1.0        # interface conditions
+lambda_eikonal: 0.1   # SDF regularization
+
+# Phase 2: Shape diversity (maximize dissimilarity between generated shapes)
+lambda_shape_diversity: 0.1   # encourages diverse shapes
+diversity_type: 'chamfer'     # 'chamfer', 'volume', 'contrastive'
+diversity_aggregation: 'min'  # 'min' maximizes min pairwise distance
+max_diversity: null           # optional: stop diversity loss above threshold
+scale_shape_diversity: 1.0
+
+# Phase 3: Connectivity (Morse theory - expensive!)
+# Penalizes index-1 saddles with f(x) ≠ 0 to encourage connected shapes
+lambda_connectivity: 0.01     # start small - this is expensive
+connectivity_n_samples: 500   # fewer samples for speed
+connectivity_n_iter: 20       # fewer iterations for speed
+connectivity_grad_tol: 0.02   # looser tolerance for speed
+connectivity_update_every_n_epochs: 100  # update cache less frequently
+scale_connectivity: 1.0
+start_connectivity: 2000      # start after shape has formed
+
+# Placeholder lambdas for future phases
+
+###################
+## Training hyperparameters
+###################
+seed: 42
+lr: 0.001
+max_epochs: 10000
+opt: adam
+
+grad_clipping:
+  grad_clipping_on: True
+  grad_clip: 0.5
+  auto_clip_on: True
+  auto_clip_percentile: 0.8
+  auto_clip_hist_len: 50
+  auto_clip_min_len: 50
+
+###################
+## Logging
+###################
+log_level: 'INFO'
+plot_every_n_epochs: 100
+valid_every_n_epochs: 500
+train_plot_max_n_shapes: 16
+
+###################
+## Problem (to be overridden)
+###################
+problem: 'simjeb'
+nx: 3
+level_set: 0.0
+
+###################
+## Meshing
+###################
+meshing:
+  mc_resolution: 128
+  mc_chunks: 1
+  mesh_reduction: 0.9

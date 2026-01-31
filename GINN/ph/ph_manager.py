@@ -46,6 +46,7 @@ class PHManager():
         self.netp = netp
         self.nx = nx
         self.bounds = bounds
+        self.func_inside_envelope = func_inside_envelope
         self.problem_str = problem_str
         self.simjeb_root_dir = simjeb_root_dir
         
@@ -65,7 +66,16 @@ class PHManager():
             atexit.register(self._cleanup_pool)
         
         self.xs, self.xs_flat = self.__generate_x_grid(self.n_grid_points, nx, self.bounds.detach().cpu().numpy())
-        self.xs_inside_envelope, self.xs_inside_envelope_mask, self.Y_inf = self.__generate_x_grid_inside_envelop(self.xs, self.xs_flat, func_inside_envelope)
+        self.xs_inside_envelope, self.xs_inside_envelope_mask, self.Y_inf = self.__generate_x_grid_inside_envelop(self.xs, self.xs_flat, self.func_inside_envelope)
+
+    def set_problem(self, problem):
+        """Update bounds and inside-envelope grid when switching problem (e.g. LEGO N)."""
+        self.bounds = problem.bounds
+        self.func_inside_envelope = problem.is_inside_envelope
+        self.xs, self.xs_flat = self.__generate_x_grid(self.n_grid_points, self.nx, self.bounds.detach().cpu().numpy())
+        self.xs_inside_envelope, self.xs_inside_envelope_mask, self.Y_inf = self.__generate_x_grid_inside_envelop(
+            self.xs, self.xs_flat, self.func_inside_envelope
+        )
         
 
     def _cleanup_pool(self):
