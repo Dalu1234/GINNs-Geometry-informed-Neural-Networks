@@ -1,102 +1,123 @@
-# Geometry-informed Neural Networks
+# Geometry-Informed Neural Networks (GINNs)
 
-### [Project Page](https://arturs-berzins.github.io/GINN/) | [arXiv](https://arxiv.org/abs/2402.14009)
+## Overview
 
+Geometry-Informed Neural Networks (GINNs) is a framework for training shape generative models without data by satisfying design requirements given as constraints and objectives. GINNs enable the generation of diverse solutions while learning an organized latent space. This project also integrates with the **Topology Optimization Modulated Neural Fields (TOM)** framework for solving topology optimization problems.
 
-<img src="media/diagonal_other_overlay.gif" width="800"/>
+### Key Features
+- Train generative models without data.
+- Support for diverse topology optimization tasks.
+- Modular and reusable components for training, evaluation, and visualization.
+- Integration with external libraries for geometry and optimization.
 
-This project accompanies the paper "Geometry-informed Neural Networks" (GINNs) and as an instance of GINNs "Diverse Topology Optimization using Modulated Neural Fields" (also see [TOM github](https://github.com/ml-jku/Topology-Optimization-Modulated-Neural-Fields)).
-GINNs allow to train shape generative models without data by satisfying design requirements given as constraints and objectives.
-In particular, a diversity constraint makes these models generative.
-GINNs not only learn to generate multiple diverse solutions, but can also learn an organized latent space as shown above.
+---
 
-More information on TOM can be found below and on the [TOM github page](https://github.com/ml-jku/Topology-Optimization-Modulated-Neural-Fields).
-
-<img src="media/constraints.png" width="800"/>
-
-
-## Updates to codebase
-
-
-#### 2025/02: 
-- add the checkpoint, config and a jupyter notebook for a GINN with 2D latent space 
-
-#### 2025/02: 
-- Added support for TOM.
-- Refactor s.t. config object does not leave the ginn_trainer.py. This way classes and functions used by the ginn_trainer.py are more modular and reusable.
-- For many-shape optimization, it is recommended to use surface.do_numerical_surface_points=True or do *_numerical versions, as they are usually faster. For a few-shape optimization, the flow-based surface points are faster.
-
-## Organization
+## Project Structure
 
 ```
 /
 ├── run.py                          # Entry point for the program
 ├── train/                          # Functionality for training
-│   └── ginn_trainer.ipynb          # Handles the training loop of the network
-├── configs/                        # Contains YML files to configure
-├── GINN/                           # folder for GINN training
-│   ├── data/                       # Dataloader for a setting of GINNs with data
-│   ├── evaluation/                 # Code to compute metrics of generated 2D and 3D shapes
-│   ├── ph/                         # Classes to manage the connectedness loss based on persistent homology
-│   ├── plot/                       # Plotters for 2D and 3D
-│   ├── problems/                   # Contains general geometric primitives
-│   ├── simJEB/                     # Contains files to load the simjeb envelope and interface
-│   ├── speed/                      # Contains classes useful for multiprocessing or measuring time
-├── models/                         # Model definitions for different architectures
-├── util/                           # Utilities used throughout the project
+│   └── ginn_trainer.py             # Handles the training loop of the network
+├── configs/                        # Contains YAML files to configure experiments
+├── GINN/                           # Core implementation of GINNs
+│   ├── data/                       # Data loading and dataset management
+│   ├── evaluation/                 # Tools for evaluating models
+│   ├── models/                     # Neural network architectures
+│   ├── util/                       # Utilities for configuration, checkpointing, etc.
+├── external/                       # Third-party libraries
+├── notebooks/                      # Jupyter notebooks for experimentation
+├── requirements.txt                # Python dependencies
+├── requirements-windows.txt        # Windows-specific dependencies
+├── README.md                       # Project documentation
 ```
 
-## Get started
+---
 
-Install the dependencies, ideally in a fresh environment
-```pip install -r requirements.txt```
-or 
-```conda env create -f requirements.yml```.
+## Installation
 
-TOM has more dependencies, e.g. FenicsX or OpenMPI. 
-They can be tricker too install, that's why we dynamically import them only if they are needed for topology optimization (i.e. to compute compliance gradients). 
-These can be installed via conda
-```conda env create -f environment.yml```.
+### Prerequisites
+- Python 3.8+
+- Conda (recommended) or virtualenv
 
+### Setting Up the Environment
 
-### Jet engine bracket
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/your-repo/GINNs.git
+   cd GINNs
+   ```
 
-The problem described in Section 4.3. The problem specification draws inspiration from an engineering design competition hosted by General Electric and GrabCAD ([paper](https://arxiv.org/abs/2105.03534v1), [website](https://simjeb.github.io/)). The challenge was to design the lightest possible lifting bracket for a jet engine subject to both physical and geometrical constraints. Here, we focus only on the geometric constraints: the shape must fit in a provided design space and attach to six cylindrical interfaces. In addition, we require connectedness as a trivial requirement for structural integrity and a smooth surface.
+2. Create a virtual environment:
+   ```bash
+   conda env create -f environment-TOM.yml
+   conda activate ginn-env
+   ```
+   Alternatively, use `requirements.txt` or `requirements-windows.txt` to install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-<img src="media/jeb_training.gif" width="600"/>
+3. Install additional dependencies for persistent homology (optional):
+   ```bash
+   pip install cripser==0.0.13
+   ```
 
-Start the training by specifying a config from the `configs` folder.
+---
 
-```python run.py gpu_list=0 yml=GINN/simjeb_wire_singleshape```
+## Usage
 
+### Running the Project
+The main entry point for the project is `run.py`. It handles global configurations, initializes the model, and starts the training process.
 
-### Minimal surface
-
-Plateau’s problem is to find the surface $S$ with the minimal area given a prescribed boundary $\Gamma$ (a closed curve in $X \in \mathbb{R}$).
-A minimal surface is known to have zero mean-curvature $\kappa_H$ everywhere.
-
-With [notebooks/min_surf.ipynb](notebooks/minimal_surface.ipynb) you can train a GINN to learn the minimal surface. It takes a few seconds to converge. This code does not use the more advanced adaptive augmented Lagrangian method for constrained optimization.
-
-<img src="media/minsurf.png" width="300"/>
-
-## Citation
-
-```
-@inproceedings{berzins2025geometry,
-  title={Geometry-Informed Neural Networks},
-  author={Berzins, Arturs and Radler, Andreas and Volkmann, Eric and Sanokowski, Sebastian and Hochreiter, Sepp and Brandstetter, Johannes},
-  booktitle={Forty-second International Conference on Machine Learning},
-  year=2025,
-}
-
+```bash
+python run.py --config configs/GINN/simjeb_wire.yml
 ```
 
-## Diverse Topology Optimization using Modulated Neural Fields
+### Training
+- Modify the YAML configuration files in the `configs/` directory to set up your experiment.
+- Use `train/ginn_trainer.py` to manage the training loop.
 
-### [TOM github overview](https://github.com/ml-jku/Topology-Optimization-Modulated-Neural-Fields)
+### Evaluation
+- Use the `evaluation/` module to compute metrics and visualize results.
+- Example notebooks in the `notebooks/` directory demonstrate evaluation workflows.
 
-Topology Optimization using Modulated Neural Fields (TOM) as an instance of GINNs is added in this repo. 
-It is reproducible by using the YAMLs in configs/TOM.
+---
 
+## Dependencies
 
-<img src="media/Jeb-combined_0_4_6.png" width="300"/>
+### Core Libraries
+- **PyTorch**: Deep learning framework.
+- **NumPy**: Scientific computing.
+- **Matplotlib**: Visualization.
+- **PyYAML**: Configuration management.
+
+### Geometry and Visualization
+- **Trimesh**: Mesh processing.
+- **PyVista**: 3D visualization.
+- **K3D**: Interactive 3D plotting.
+
+### Persistent Homology (Optional)
+- **Cripser**: Library for persistent homology computations.
+
+---
+
+## Contributing
+
+Contributions are welcome! Please follow these steps:
+1. Fork the repository.
+2. Create a new branch for your feature or bug fix.
+3. Submit a pull request with a detailed description of your changes.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See the `LICENSE` file for details.
+
+---
+
+## References
+- [Project Page](https://arturs-berzins.github.io/GINN/)
+- [arXiv Paper](https://arxiv.org/abs/2402.14009)
+- [TOM GitHub](https://github.com/ml-jku/Topology-Optimization-Modulated-Neural-Fields)

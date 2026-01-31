@@ -121,7 +121,10 @@ def get_model_path_via_wandb_id_from_fs(run_id, root_dir, use_epoch=None, get_fi
     raise ValueError(f"Could not find model with {run_id=} anywhere")
 
 
-def load_model_optim_sched(config, model, optim, sched, device='cuda'):
+def load_model_optim_sched(config, model, optim, sched, device=None):
+    ## Auto-detect device if not specified
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     ## Load model weights
     if not (config.get('load_model', False) or config.get('load_mos', False)):
         if 'model_load_path' in config or 'model_load_wandb_id' in config:

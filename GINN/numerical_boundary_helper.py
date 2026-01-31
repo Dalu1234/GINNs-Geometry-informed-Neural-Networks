@@ -40,7 +40,16 @@ class NumericalBoundaryHelper:
         self.bin_search_steps = bin_search_steps
         
         self.logger = logging.getLogger('surf_pts_helper')
+        self.equidistant_init_grid = equidistant_init_grid
         self.grid_find_surface, self.grid_dist_find_surface, self.init_grid_resolution = precompute_sample_grid(self.surf_pts_nof_points, self.bounds, equidistant=equidistant_init_grid)
+
+    def set_problem(self, problem):
+        """Update bounds and interface from problem (e.g. when switching N for LEGO 1xN)."""
+        self.bounds = problem.bounds
+        self.x_interface = problem.sample_from_interface()[0]
+        self.grid_find_surface, self.grid_dist_find_surface, self.init_grid_resolution = precompute_sample_grid(
+            self.surf_pts_nof_points, self.bounds, equidistant=self.equidistant_init_grid
+        )
         
     def get_surface_pts(self, z, interface_cutoff, plot, plot_max_shapes=None):
         with Timer.record('get_surface_pts'):

@@ -18,6 +18,7 @@ def main():
 
     # read CLI args
     config = read_cli_args_and_get_config()
+
     set_cuda_devices(config['gpu_list'])
 
     # set up logging
@@ -60,9 +61,10 @@ def main():
             device = 'cpu'
         print(f'Visible CUDA devices: {os.getenv("CUDA_VISIBLE_DEVICES")} - using device {device}')
         torch.set_default_device(device)
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
     else:
         print('CUDA not available - proceeding on CPU')
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        torch.set_default_tensor_type('torch.FloatTensor')
     
     # NOTE: to disable wandb set the ENV
     # "WANDB_MODE": "disabled"
