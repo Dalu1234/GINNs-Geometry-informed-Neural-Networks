@@ -1,4 +1,5 @@
 import math
+import random
 import time
 import torch
 from tqdm import trange
@@ -25,6 +26,7 @@ from GINN.ph.ph_plotter import PHPlotter
 from GINN.ph.ph_manager import PHManager
 from GINN.speed.timer import Timer
 from train.train_utils.latent_sampler import LatentSampler
+from train.train_utils.violation_buffer import ViolationBuffer
 from util.checkpointing import load_model_optim_sched, save_model_every_n_epochs
 from util.misc import combine_dicts, do_plot, get_model, get_problem, is_every_n_epochs_fulfilled
 from train.losses_ginn import *
@@ -55,7 +57,14 @@ class Trainer():
         model_kw = dict(config['model'])
         model_kw['layers'] = list(model_kw.get('layers', [128, 128, 128]))  # copy; get_model mutates
         if self.condition_on_n_studs:
-            self.n_studs_values = list(config.get('n_studs_values', [2, 3, 4, 6]))
+
+            # Prefer top-level; LEGO config may keep it under vars after merge
+            self.n_studs_values = list(
+                config.get('n_studs_values')
+                or config.get('vars', {}).get('n_studs_values')
+                or [2, 3]
+            )
+            self.logger.info(f'n_studs_values (brick types): {self.n_studs_values}')
             model_kw['nz'] = model_kw['nz'] + 1  # shape latent + 1 for N
         if self.condition_on_n_studs_y:
             self.n_studs_y_values = list(config.get('n_studs_y_values', [1, 2, 4]))  # 1 = 1xN, 2+ = NxM
@@ -65,9 +74,9 @@ class Trainer():
             model_kw['nz'] = model_kw['nz'] + 1  # +1 for height scale
         self.model = get_model(**model_kw)
         self.netp = NetWithPartials.create_from_model(self.model, **model_kw)
-        self.problem = get_problem(problem_config=self.config['problem'], **self.config['problem_sampling'])
         if self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height:
             # One problem per (N, N_y, height) or subset; constraints unchanged per problem
+            # Build problems from n_studs_values etc. only (do not create default problem with config['problem'].n_studs: 4)
             self.problems = {}
             if self.condition_on_n_studs:
                 self._n_list = self.n_studs_values
@@ -99,6 +108,8 @@ class Trainer():
             n0, ny0, h0 = self._n_list[0], self._ny_list[0], self._h_list[0]
             key0 = (n0, ny0, h0) if self.condition_on_height and self.condition_on_n_studs_y else (n0, ny0) if self.condition_on_n_studs_y else (n0, h0) if self.condition_on_height else n0
             self.problem = self.problems[key0]
+        else:
+            self.problem = get_problem(problem_config=self.config['problem'], **self.config['problem_sampling'])
 
         self.timer = Timer(**self.config['timer'], lock=mp_manager.get_lock())
         self.mpm.set_timer(self.timer)  ## weak circular reference
@@ -171,6 +182,28 @@ class Trainer():
                 near_surface_threshold=self.config.get('connectivity_near_surface_threshold', 0.15),
                 max_step_size=self.config.get('connectivity_max_step_size', 0.3),
             )
+
+        # Violation buffer: sample (z, c) proportional to interface+envelope violation
+        vb_cfg = self.config.get('violation_buffer', {}) or {}
+        self.use_violation_buffer = (
+            vb_cfg.get('use', False)
+            and (self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height)
+        )
+        self.violation_buffer = None
+        if self.use_violation_buffer:
+            nz_base = self.config['latent_sampling']['nz']
+            c_keys = list(self.problems.keys())
+            z_interval = self.config['latent_sampling'].get('z_sample_interval', [0.0, 0.1])
+            initial_size_per_c = vb_cfg.get('initial_size_per_c', 50)
+            self.violation_buffer = ViolationBuffer(
+                nz_base=nz_base,
+                c_keys=c_keys,
+                z_interval=z_interval,
+                initial_size_per_c=initial_size_per_c,
+                device=torch.get_default_device(),
+                eps=vb_cfg.get('eps', 1e-8),
+            )
+            self.logger.info(f'Violation buffer: {len(self.violation_buffer)} entries ({initial_size_per_c} per c_key)')
         
         # loss balancing
         self.scalar_loss_keys, self.field_loss_keys, lambda_dict, objective_key = get_loss_keys_and_lambdas(self.config)
@@ -194,6 +227,24 @@ class Trainer():
             self.ph_manager.set_problem(self.problem)
         if self.cached_connectivity_loss is not None:
             self.cached_connectivity_loss.bounds = self.problem.bounds
+
+    def _unpack_ckey(self, c_key):
+        """Return (N, ny, h) from c_key (tuple or int) for building conditioning cols."""
+        if isinstance(c_key, tuple):
+            if len(c_key) == 3:
+                return c_key[0], c_key[1], c_key[2]
+            if len(c_key) == 2:
+                return c_key[0], c_key[1], 1.0
+            return c_key[0], 1, 1.0
+        return c_key, 1, 1.0
+
+    def _compute_violation_for_z_c(self, z_single, c_key):
+        """Interface + envelope loss (no_grad) for one (z, c) pair."""
+        problem = self.problems[c_key]
+        with torch.no_grad():
+            l_if = loss_if(z=z_single, netp=self.netp, p_sampler=problem, level_set=self.config['level_set'])
+            l_env = loss_env(z=z_single, netp=self.netp, p_sampler=problem, level_set=self.config['level_set'], nf_is_density=self.config['nf_is_density'])
+        return (l_if + l_env).item()
         
     def train(self):
         
@@ -259,63 +310,166 @@ class Trainer():
                     key0 = (n0, ny0, h0) if self.condition_on_height and self.condition_on_n_studs_y else (n0, ny0) if self.condition_on_n_studs_y else (n0, h0) if self.condition_on_height else n0
                     self.problem = self.problems[key0]
                     self._sync_problem_dependents()
-                    # z_val has different (n,ny,h) per row; use only first row so bounds match this problem
                     z_val_single = z_val[:1]
                 else:
                     z_val_single = z_val
                 self.model.eval()
-                # plot validation shapes (bounds must match conditioning in z_val_single)
+                # plot validation shapes with variety: one mesh per brick type (each row of z_val)
                 if self.config['nx'] == 2:
                     Y = self.problem.recalc_output(self.netp, z_val_single, **self.config['meshing'])
                     if self.config['lambda_comp'] > 0:
                         Y = heaviside(Y, beta=self.beta, nf_is_density=self.config['nf_is_density'])
                     self.plotter.reset_output(Y.cpu().numpy(), epoch=epoch)
+                    self.mpm.plot(self.plotter.plot_shape, 'val_plot_shape', kwargs_dict={'fig_label': 'Val Boundary', 'is_validation': True})
                 elif self.config['nx'] == 3:
-                    self.plotter.reset_output(self.problem.recalc_output(self.netp, z_val_single, **self.config['meshing']), epoch=epoch)
-                self.mpm.plot(self.plotter.plot_shape, 'val_plot_shape', kwargs_dict={'fig_label': 'Val Boundary', 'is_validation': True})
+                    if self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height:
+                        n_rows, n_cols = self.plotter.val_plot_grid
+                        expected = n_rows * n_cols
+                        val_verts_faces = []
+                        for i in range(z_val.shape[0]):
+                            n_i = self.n_studs_values[i % len(self.n_studs_values)]
+                            ny_i = self.n_studs_y_values[i % len(self.n_studs_y_values)]
+                            h_i = self.height_values[i % len(self.height_values)]
+                            if self.condition_on_height and self.condition_on_n_studs_y:
+                                key_i = (n_i, ny_i, h_i)
+                            elif self.condition_on_n_studs_y:
+                                key_i = (n_i, ny_i)
+                            elif self.condition_on_height:
+                                key_i = (n_i, h_i)
+                            else:
+                                key_i = n_i
+                            if key_i not in self.problems:
+                                continue
+                            self.problem = self.problems[key_i]
+                            self._sync_problem_dependents()
+                            z_row = z_val[i : i + 1]
+                            out_i = self.problem.recalc_output(self.netp, z_row, **self.config['meshing'])
+                            if out_i is not None and len(out_i) > 0:
+                                val_verts_faces.append(out_i[0])
+                        if len(val_verts_faces) == expected:
+                            self.plotter.reset_output(val_verts_faces, epoch=epoch)
+                            self.mpm.plot(self.plotter.plot_shape, 'val_plot_shape', kwargs_dict={'fig_label': 'Val Boundary', 'is_validation': True})
+                        else:
+                            self.plotter.reset_output(self.problem.recalc_output(self.netp, z_val_single, **self.config['meshing']), epoch=epoch)
+                            self.mpm.plot(self.plotter.plot_shape, 'val_plot_shape', kwargs_dict={'fig_label': 'Val Boundary', 'is_validation': True})
+                        self.problem = self.problems[key0]
+                        self._sync_problem_dependents()
+                    else:
+                        self.plotter.reset_output(self.problem.recalc_output(self.netp, z_val_single, **self.config['meshing']), epoch=epoch)
+                        self.mpm.plot(self.plotter.plot_shape, 'val_plot_shape', kwargs_dict={'fig_label': 'Val Boundary', 'is_validation': True})
+                else:
+                    self.mpm.plot(self.plotter.plot_shape, 'val_plot_shape', kwargs_dict={'fig_label': 'Val Boundary', 'is_validation': True})
                 
-                # compute validation metrics (same z_val_single so bounds match)
+                # compute validation metrics over multiple brick types (each row of z_val = one brick type)
                 if epoch > 0 and is_every_n_epochs_fulfilled(epoch, self.config, 'val_shape_metrics_every_n_epochs'):
-                    mesh_or_contour = self.problem.get_mesh_or_contour(self.netp.f_, self.netp.params, z_val_single)
-                    if mesh_or_contour is not None:
-                        self.mpm.metrics(self.meter.get_average_metrics_as_dict, arg_list=[mesh_or_contour], kwargs_dict={'prefix': 'm_val_'})
+                    if self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height:
+                        val_meshes = []
+                        for i in range(z_val.shape[0]):
+                            # key for row i: same indexing as z_val cols (n, ny, h)
+                            n_i = self.n_studs_values[i % len(self.n_studs_values)]
+                            ny_i = self.n_studs_y_values[i % len(self.n_studs_y_values)]
+                            h_i = self.height_values[i % len(self.height_values)]
+                            if self.condition_on_height and self.condition_on_n_studs_y:
+                                key_i = (n_i, ny_i, h_i)
+                            elif self.condition_on_n_studs_y:
+                                key_i = (n_i, ny_i)
+                            elif self.condition_on_height:
+                                key_i = (n_i, h_i)
+                            else:
+                                key_i = n_i
+                            if key_i not in self.problems:
+                                continue
+                            self.problem = self.problems[key_i]
+                            self._sync_problem_dependents()
+                            z_row = z_val[i : i + 1]
+                            mesh_or_contour_i = self.problem.get_mesh_or_contour(self.netp.f_, self.netp.params, z_row)
+                            if mesh_or_contour_i is not None and len(mesh_or_contour_i) > 0:
+                                val_meshes.append(mesh_or_contour_i[0])
+                        if val_meshes:
+                            self.mpm.metrics(self.meter.get_average_metrics_as_dict, arg_list=[val_meshes], kwargs_dict={'prefix': 'm_val_'})
+                    else:
+                        mesh_or_contour = self.problem.get_mesh_or_contour(self.netp.f_, self.netp.params, z_val_single)
+                        if mesh_or_contour is not None:
+                            self.mpm.metrics(self.meter.get_average_metrics_as_dict, arg_list=[mesh_or_contour], kwargs_dict={'prefix': 'm_val_'})
 
             ## training
             self.model.train()
-            # In generative mode, resample z every batch for world model training
-            if self.config.get('training_mode', 'single') == 'generative':
-                z = self.z_sampler.train_z()
-            elif epoch > 0 and is_every_n_epochs_fulfilled(epoch, self.config, 'reset_zlatents_every_n_epochs'):
-                z = self.z_sampler.train_z()
-            # LEGO 1xN / NxN: condition on N, N_y, and/or height; sample per batch, switch problem, append to z
-            if self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height:
-                N = self.n_studs_values[torch.randint(len(self.n_studs_values), (1,)).item()] if self.condition_on_n_studs else self.config['problem'].get('n_studs', 4)
-                ny = self.n_studs_y_values[torch.randint(len(self.n_studs_y_values), (1,)).item()] if self.condition_on_n_studs_y else 1
-                h = self.height_values[torch.randint(len(self.height_values), (1,)).item()] if self.condition_on_height else 1.0
-                if self.condition_on_height and self.condition_on_n_studs_y:
-                    key = (N, ny, h)
-                elif self.condition_on_height:
-                    key = (N, h)
-                elif self.condition_on_n_studs_y:
-                    key = (N, ny)
+            # Violation buffer: sample (z, c) proportional to interface+envelope violation
+            if self.use_violation_buffer:
+                vb_cfg = self.config.get('violation_buffer', {}) or {}
+                c_keys_list = list(self.problems.keys())
+                block_epochs = vb_cfg.get('block_epochs_per_type', 0) or self.config.get('block_epochs_per_type', 0) or 0
+                if block_epochs > 0:
+                    type_index = (epoch // block_epochs) % len(c_keys_list)
+                    c_key = c_keys_list[type_index]
                 else:
-                    key = N
-                self.problem = self.problems[key]
+                    c_key = random.choice(c_keys_list)
+                z_bases, indices = self.violation_buffer.sample_batch(
+                    c_key, self.config['ginn_bsize'],
+                    temperature=vb_cfg.get('sample_temperature', 1.0),
+                    random_fraction=vb_cfg.get('random_fraction', 0.1),
+                )
+                N, ny, h = self._unpack_ckey(c_key)
+                self.problem = self.problems[c_key]
                 self._sync_problem_dependents()
                 cols = []
                 if self.condition_on_n_studs:
                     n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
                     n_norm = (N - n_min) / max(n_max - n_min, 1)
-                    cols.append(torch.full((z.shape[0], 1), n_norm, device=z.device, dtype=z.dtype))
+                    cols.append(torch.full((z_bases.shape[0], 1), n_norm, device=z_bases.device, dtype=z_bases.dtype))
                 if self.condition_on_n_studs_y:
                     ny_min, ny_max = min(self.n_studs_y_values), max(self.n_studs_y_values)
                     ny_norm = (ny - ny_min) / max(ny_max - ny_min, 1)
-                    cols.append(torch.full((z.shape[0], 1), ny_norm, device=z.device, dtype=z.dtype))
+                    cols.append(torch.full((z_bases.shape[0], 1), ny_norm, device=z_bases.device, dtype=z_bases.dtype))
                 if self.condition_on_height:
                     h_min, h_max = min(self.height_values), max(self.height_values)
                     h_norm = (h - h_min) / max(h_max - h_min, 1e-6)
-                    cols.append(torch.full((z.shape[0], 1), h_norm, device=z.device, dtype=z.dtype))
-                z = torch.cat([z] + cols, dim=1)
+                    cols.append(torch.full((z_bases.shape[0], 1), h_norm, device=z_bases.device, dtype=z_bases.dtype))
+                z = torch.cat([z_bases] + cols, dim=1)
+                self._vb_batch_ckey = c_key
+                self._vb_batch_indices = indices
+            else:
+                # In generative mode, resample z every batch for world model training
+                if self.config.get('training_mode', 'single') == 'generative':
+                    z = self.z_sampler.train_z()
+                elif epoch > 0 and is_every_n_epochs_fulfilled(epoch, self.config, 'reset_zlatents_every_n_epochs'):
+                    z = self.z_sampler.train_z()
+                # LEGO 1xN / NxN: condition on N, N_y, and/or height; sample per batch, switch problem, append to z
+                if self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height:
+                    block_epochs = self.config.get('violation_buffer', {}).get('block_epochs_per_type', 0) or self.config.get('block_epochs_per_type', 0) or 0
+                    if block_epochs > 0:
+                        c_keys_list = list(self.problems.keys())
+                        type_index = (epoch // block_epochs) % len(c_keys_list)
+                        key = c_keys_list[type_index]
+                        N, ny, h = self._unpack_ckey(key)
+                    else:
+                        N = self.n_studs_values[torch.randint(len(self.n_studs_values), (1,)).item()] if self.condition_on_n_studs else self.config['problem'].get('n_studs', 4)
+                        ny = self.n_studs_y_values[torch.randint(len(self.n_studs_y_values), (1,)).item()] if self.condition_on_n_studs_y else 1
+                        h = self.height_values[torch.randint(len(self.height_values), (1,)).item()] if self.condition_on_height else 1.0
+                        if self.condition_on_height and self.condition_on_n_studs_y:
+                            key = (N, ny, h)
+                        elif self.condition_on_height:
+                            key = (N, h)
+                        elif self.condition_on_n_studs_y:
+                            key = (N, ny)
+                        else:
+                            key = N
+                    self.problem = self.problems[key]
+                    self._sync_problem_dependents()
+                    cols = []
+                    if self.condition_on_n_studs:
+                        n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                        n_norm = (N - n_min) / max(n_max - n_min, 1)
+                        cols.append(torch.full((z.shape[0], 1), n_norm, device=z.device, dtype=z.dtype))
+                    if self.condition_on_n_studs_y:
+                        ny_min, ny_max = min(self.n_studs_y_values), max(self.n_studs_y_values)
+                        ny_norm = (ny - ny_min) / max(ny_max - ny_min, 1)
+                        cols.append(torch.full((z.shape[0], 1), ny_norm, device=z.device, dtype=z.dtype))
+                    if self.condition_on_height:
+                        h_min, h_max = min(self.height_values), max(self.height_values)
+                        h_norm = (h - h_min) / max(h_max - h_min, 1e-6)
+                        cols.append(torch.full((z.shape[0], 1), h_norm, device=z.device, dtype=z.dtype))
+                    z = torch.cat([z] + cols, dim=1)
             # only plot the GINN points in the first epoch, as they are memory-intensive
             # if self.feni.constraint_to_pts_dict if epoch > 0 else combine_dicts([self.feni.constraint_to_pts_dict, self.problem.constr_pts_dict])
             vis_pts_dict = {} if epoch > 0 else self.problem.constr_pts_dict
@@ -371,7 +525,17 @@ class Trainer():
             if self.config.get('use_scheduler', False):
                 sched.step()
 
-            self.loss_calculator.adaptive_update()  # is a no-op for ManualWeightedLoss
+            # Refresh violation scores for the (z, c) pairs we just used (post-update model); random slots have no buffer index
+            if self.use_violation_buffer:
+                violations = [self._compute_violation_for_z_c(z[i:i + 1], self._vb_batch_ckey) for i in range(z.shape[0])]
+                valid = [(i, v) for i, v in zip(self._vb_batch_indices, violations) if i is not None]
+                if valid:
+                    idx, vals = zip(*valid)
+                    self.violation_buffer.update_violations(list(idx), list(vals))
+
+            # Skip ALM update when we skipped the step so multipliers don't grow on no-op epochs
+            if not getattr(self, '_last_step_skipped', False):
+                self.loss_calculator.adaptive_update()  # is a no-op for ManualWeightedLoss
 
             ## Async Logging
             cur_log_dict.update({
@@ -487,13 +651,26 @@ class Trainer():
 
         ## compute total loss
         loss = self.loss_calculator.compute_loss_and_save_sublosses(loss_dict)
+        # When diversity is on but get_surface_pts failed (degenerate SDF), skip backward so we don't
+        # push the model into collapse. Backward uses sum(loss_weighted_dict), so we must skip the call.
+        skip_step = (
+            epoch >= self.config.get('start_div', 0)
+            and self.p_surface is None
+            and LossKey('div') in self.all_loss_keys
+        )
+        if skip_step:
+            self.logger.info('Surface points failed (epoch >= start_div) — skipping backward')
+        self._last_step_skipped = skip_step  # so trainer can skip adaptive_update when we didn't step
         
-        # do backward here directly, as we need x_field
-        if self.config.get('use_config', False):
-            self.loss_calculator.backward_config(field_dict, self.model)
+        # do backward here directly, as we need x_field (skip when surface points failed)
+        if not skip_step:
+            if self.config.get('use_config', False):
+                self.loss_calculator.backward_config(field_dict, self.model)
+            else:
+                self.loss_calculator.backward(field_dict)
         else:
-            self.loss_calculator.backward(field_dict)
-        
+            # No gradients: opt.step() will add zero to params
+            pass
 
         return loss, self.loss_calculator.get_dicts()
     

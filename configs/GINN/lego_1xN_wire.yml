@@ -7,20 +7,20 @@ wandb_experiment_name: 'lego_1xN_cond_wire'
 vars:
   nx: 3 # input is 3D
   nz: 2 # dimension of the modulation vector (shape latent; +1 when condition_on_n_studs)
-  ginn_bsize: 9 # usually denoted as bz in the code; i.e. the number of ginn models to train in parallel
+  ginn_bsize: 6 # batch size; use 6 or 4 if OOM with 3+ brick types (was 9)
   val_plot_grid: [3, 3] # [n_first_dims, shapes_per_dim]; sampled using equidistant z (if nz>2), otherwise see latent_sampler
   problem_str: 'lego_1xN'
   ginn_on: 1
   # Conditioning on N (number of studs): one model for 1x2, 1x3, 1x4, 1x6 etc.
   condition_on_n_studs: true
-  n_studs_values: [2, 3, 4, 6]  # allowed N; stud spacing etc. unchanged per problem
+  n_studs_values: [2, 4]  # N studs: 2 and 4 → 1x2, 1x4
   # Conditioning on NxN (second dimension): 1 = 1xN, 2+ = NxM grid
   condition_on_n_studs_y: true
-  n_studs_y_values: [1, 2, 4]  # 1 = 1xN only; 2 = 2xN/Nx2; 4 = 4xN/Nx4
+  n_studs_y_values: [1]   # 1 = 1xN only → no 2x2, 4x4
   # Conditioning on height: scale brick body height (1.0 = nominal LEGO)
   condition_on_height: true
-  height_values: [0.75, 1.0, 1.25]  # height scale factors
-  n_points_surface: 40001 # number of points sampled to find the surface points
+  height_values: [1.0]     # one height → 2×1×1 = 2 types: (2,1,1.0)=1x2, (4,1,1.0)=1x4
+  n_points_surface: 20000  # reduced from 40001 to avoid CUDA OOM when curvature starts (get_surface_pts)
   nf_is_density: False
   level_set: 0.0
 
@@ -46,7 +46,13 @@ model:
   return_density: ${vars.nf_is_density}
   w0_initial: 18
   wire_scale: 6
-  layers: [128,128,128]  # 3x128 and 3x256 perform similarly (see 67hsix5l vs 2kml4jrp)
+  layers: [256,256,256,256]  # 4x256 (was 3x128); more capacity for multi-type / sharper geometry — watch GPU memory
+  # Tiled coords: append (x_tile, y_tile) modulo stud spacing so the network sees position within each tile (one cylinder per tile)
+  use_tiled_coords: true
+  stud_spacing_normalized: 1.0   # in normalized LEGO space one stud spacing = 1.0
+  # Distance to brick edge: append signed dist_to_edge_x (positive inside, negative outside) so the network can ignore phantom studs
+  use_dist_to_edge: true
+  n_studs_values: ${n_studs_values}   # required for dist_to_edge; z column index for n is n_norm_col (default 2)
 
 reset_zlatents_every_n_epochs: 1  # uncomment to set; not set means the latents are kept fix
 latent_sampling:
@@ -55,6 +61,15 @@ latent_sampling:
   z_sample_method: 'uniform'  # any of ['uniform', 'normal', 'equidistant']
   val_plot_grid: ${vars.val_plot_grid}
   z_sample_interval: [0,0.1]
+
+# Violation buffer: sample (z, c) proportional to interface+envelope violation (prioritized replay)
+violation_buffer:
+  use: true
+  initial_size_per_c: 50   # (z_base, c) pairs per brick type at start
+  sample_temperature: 1.0  # >1 smooths, <1 sharpens (more focus on high violation)
+  random_fraction: 0.1     # mix in ~10% fresh random z to avoid collapsing onto a tiny corner of z space
+  block_epochs_per_type: 0    # OFF temporarily: random type each step; with 2 types fine; removes one variable from experiment
+  eps: 1.0e-8              # add to violations for sampling (avoid zero prob)
 
 
 ###################
@@ -70,7 +85,7 @@ valid_every_n_epochs: 200
 ## global switch for GINN losses
 
 ## GINN losses
-objective: 'curv'
+objective: 'null'   # no single objective; minimize weighted sum (interface, env, eikonal, scc, curv). Was 'curv' — curvature as objective was drifting interface fit.
 
 ## Data losses
 
@@ -79,15 +94,15 @@ lambda_lip: ${eval:1.0e-7 * 0}
 lambda_dirichlet: ${eval:1.0e1 * 0}
 
 ### local
-lambda_if: ${eval:${vars.ginn_on} * 10}
-lambda_env: ${eval:${vars.ginn_on} * 1}
+lambda_if: ${eval:${vars.ginn_on} * 48}   # mu_if still rising; stronger interface so boundary stops drifting (was 32)
+lambda_env: ${eval:${vars.ginn_on} * 2}  # keep shape inside envelope (mu_env was rising + volatile; was 1)
 lambda_obst: ${eval:${vars.ginn_on} * 0.0}
-lambda_if_normal: ${eval:${vars.ginn_on} * 1.0}
+lambda_if_normal: ${eval:${vars.ginn_on} * 2.0}   # stronger normals for flatter walls/studs; was 1.5
 ### global
 lambda_eikonal: ${eval:${vars.ginn_on} * 1.0}
-lambda_scc: ${eval:${vars.ginn_on} * 20}   # SCC (PH): fully connected mesh (target Betti [1,0,0])
-lambda_curv: 1 #5.0e-3
-lambda_div: 1
+lambda_scc: ${eval:${vars.ginn_on} * 35}   # SCC: push harder for single connected mesh; was 20 (disjoint at 900)
+lambda_curv: 0   # off for LEGO: interface + if_normal define shape; curvature competed with interface and rounded sharp edges
+lambda_div: 0   # off for this run: training without diversity loss
 
 max_curv: 0 # 180 # 500
 max_div: -0.1
@@ -98,7 +113,7 @@ max_div: -0.1
 #   - Curvature (curv): ~300–500 — regularize surface once SDF is roughly correct
 #   - Diversity (div): ~500–800 — encourage latent diversity after geometry is good
 start_curv: 500   # regularize curvature after shape is fitting
-start_div: 2000   # diversity after curv has smoothed; delay so geometry dominates longer
+start_div: 2000   # diversity after curv has smoothed; step is skipped when get_surface_pts fails (see trainer)
 
 scale_curv: 5.0e-4
 # scale_curv: 1.0e-3
@@ -134,7 +149,8 @@ ph:
   ph_loss_maxdim: 1
   ph_loss_target_betti: [1, 0, 0]
   scc_penalty_norm_eps: 1.0e-4
-  scc_n_grid_points: 64
+  scc_n_grid_points: 32   # 64 caused MemoryError in SCC workers (cripser.computePH); 32 reduces RAM
+  ph_max_num_workers: 4   # fewer workers = less peak RAM when computing PH (base 16)
   evaluate_ph_grid_per_shape: True  # Set to True to save memory, but it's slower
 
 ###################
@@ -168,8 +184,8 @@ div_norm_order: 2
 ###################
 log_level: 'INFO'
 
-## Multi-processing
-num_workers: ${eval:min(${vars.ginn_bsize},9)}  # 0 means no multi-processing
+## Multi-processing (can set to 9 for plotting/PH even when ginn_bsize is reduced for OOM)
+num_workers: 9  # was min(ginn_bsize,9); use 9 for full parallelism or match ginn_bsize to save RAM
 
 ## Plotting
 plot:
@@ -183,6 +199,8 @@ meshing:
   level_set: ${vars.level_set}
   nf_is_density: ${vars.nf_is_density}
   mc_resolution: 256   # higher for clearer studs/walls when re-extracting
+  mc_chunks: 1         # must be 1 when watertight=True
+  max_points_per_batch: 32768   # 32^3; avoid GPU OOM on 8GB during validation mesh extraction
   mesh_reduction: 0    # 0 = no simplification; was 0.9 (blobs). Re-extract from checkpoint to test.
 
 
@@ -206,12 +224,12 @@ problem:
   n_studs: 4  # LEGO-specific: default when not conditioning; ignored when condition_on_n_studs is true (N sampled per batch)
 
 problem_sampling:
-  ## Number of points to sample
+  ## Number of points to sample (reduce if OOM: envelope/interfaces/normals dominate memory)
   nx: ${vars.nx}
   n_points_domain: 2048  # used for eikonal loss
-  n_points_envelope: 16384
-  n_points_interfaces: 4096
-  n_points_normals: 4096
+  n_points_envelope: 12288   # was 16384; reduce to 8192 if still OOM
+  n_points_interfaces: 6144  # was 8192; reduce if OOM
+  n_points_normals: 6144     # match interfaces
   n_points_surface: ${vars.n_points_surface}
 
 ###################

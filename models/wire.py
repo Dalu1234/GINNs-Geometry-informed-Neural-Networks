@@ -180,6 +180,10 @@ class WIRE_original(nn.Module):
 class ConditionalWIRE(nn.Module):
     '''
     Since complex numbers don't work with jacrev, we need to use the real number version of the WIRE.
+    Optional tiled coordinates: append (x_tile, y_tile) modulo stud spacing so the network
+    sees position within each tile and can learn one cylindrical feature per tile.
+    Optional dist_to_edge_x: append signed distance to nearest x-boundary (positive inside brick)
+    so the network can ignore phantom studs outside the brick (e.g. dist_to_edge_x < 0).
     '''
     def __init__(self, 
                  layers: List[int],
@@ -187,7 +191,13 @@ class ConditionalWIRE(nn.Module):
                  first_omega_0=30, 
                  hidden_omega_0=30., 
                  scale=10.0, 
-                 use_legacy_gabor=False, 
+                 use_legacy_gabor=False,
+                 use_tiled_coords=False,
+                 stud_spacing=1.0,
+                 stud_spacing_y=None,
+                 use_dist_to_edge=False,
+                 n_studs_values=None,
+                 n_norm_col=2,
                  **kwargs):
         super().__init__()
         self.layers = layers
@@ -196,6 +206,12 @@ class ConditionalWIRE(nn.Module):
         self.hidden_omega_0 = hidden_omega_0
         self.scale = scale
         self.use_legacy_gabor = use_legacy_gabor
+        self.use_tiled_coords = use_tiled_coords
+        self.stud_spacing_x = stud_spacing
+        self.stud_spacing_y = stud_spacing if stud_spacing_y is None else stud_spacing_y
+        self.use_dist_to_edge = use_dist_to_edge and (n_studs_values is not None and len(n_studs_values) > 0)
+        self.n_studs_values = list(n_studs_values) if n_studs_values is not None else []
+        self.n_norm_col = n_norm_col
         
         # All results in the paper were with the default complex 'gabor' nonlinearity
         # NOTE: I used partial(RelGaborLayer, omega0=first_omega_0, sigma0=scale) to set the default values, but there was some weird behavior. 
@@ -228,7 +244,13 @@ class ConditionalWIRE(nn.Module):
         self.net = nn.Sequential(*self.net)
     
     def forward(self, x, z):
-        # convert to the right data type
+        if self.use_dist_to_edge:
+            from util.model_utils import dist_to_edge_x_from_z
+            dist_x = dist_to_edge_x_from_z(x, z, self.n_studs_values, self.n_norm_col)
+            x = torch.cat([x, dist_x.unsqueeze(-1)], dim=-1)
+        if self.use_tiled_coords:
+            from util.model_utils import tile_coords_xy
+            x = tile_coords_xy(x, period_x=self.stud_spacing_x, period_y=self.stud_spacing_y, center=True)
         xz = torch.cat([x, z], dim=-1)
         output = self.net(xz)
         return output

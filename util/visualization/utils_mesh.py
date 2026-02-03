@@ -123,10 +123,12 @@ def get_mesh(model,
         return_normals=0,
         watertight=False,
         nf_is_density=False,
+        max_points_per_batch=None,
         ):
     '''
     For marchihng cubes split the evaluation of the grid into chunks since for high resolutions memory can be limiting.
     NOTE: for chunks>1 there are duplicate vertices at the seams. Merge them.
+    If max_points_per_batch is set, evaluate the model on at most that many points per call to avoid GPU OOM.
     '''
     with torch.no_grad():
         verts_all = []
@@ -152,7 +154,15 @@ def get_mesh(model,
                     lsz = torch.linspace(zmin, zmax, num_el_z//chunks, device=device)
                     X, Y, Z = torch.meshgrid(lsx, lsy, lsz, indexing='ij')
                     pts = torch.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
-                    vs = model(pts.to(device=device))
+                    # Sub-batch to avoid GPU OOM when grid is large (e.g. 256^3 on 8GB)
+                    if max_points_per_batch is not None and pts.shape[0] > max_points_per_batch:
+                        vs_list = []
+                        for start in range(0, pts.shape[0], max_points_per_batch):
+                            end = min(start + max_points_per_batch, pts.shape[0])
+                            vs_list.append(model(pts[start:end].to(device=device)))
+                        vs = torch.cat(vs_list, dim=0)
+                    else:
+                        vs = model(pts.to(device=device))
                     # have to convert density to pseudo-SDF
                     if nf_is_density:
                         # e.g. if level_set = 0.7, then inside are all values where 
@@ -193,7 +203,8 @@ def get_mesh(model,
     if return_normals: return verts, faces, normals
     return verts, faces
 
-def get_watertight_mesh_for_latent(f, params, z, bounds, mc_resolution=256, device='cpu', chunks=1, surpress_watertight=False, level=0, nf_is_density=False):
+def get_watertight_mesh_for_latent(f, params, z, bounds, mc_resolution=256, device='cpu', chunks=1, surpress_watertight=False, level=0, nf_is_density=False, max_points_per_batch=None):
+    """max_points_per_batch: if set, evaluate grid in sub-batches to avoid GPU OOM (e.g. 400000 for 8GB)."""
     def f_fixed_z(x):
         """A wrapper for calling the model with a single fixed latent code"""
         with torch.no_grad():
@@ -208,7 +219,8 @@ def get_watertight_mesh_for_latent(f, params, z, bounds, mc_resolution=256, devi
                                 return_normals=0,
                                 watertight=True,
                                 level=level,
-                                nf_is_density=nf_is_density)
+                                nf_is_density=nf_is_density,
+                                max_points_per_batch=max_points_per_batch)
     # print(f"Found a mesh with {len(verts_)} vertices and {len(faces_)} faces")
     
     if surpress_watertight: return verts_, faces_

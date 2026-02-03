@@ -128,7 +128,8 @@ class ProblemBase():
                                             level=level_set,
                                             nf_is_density=nf_is_density,
                                             watertight=True,
-                                            return_normals=0)
+                                            return_normals=0,
+                                            max_points_per_batch=kwargs.get('max_points_per_batch'))
                 if mesh_reduction > 0.0:
                     verts_, faces_ = fast_simplification.simplify(verts_, faces_, target_reduction=mesh_reduction) ## target_reduction
 

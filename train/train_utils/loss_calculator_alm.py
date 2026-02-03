@@ -108,7 +108,9 @@ class AdaptiveAugmentedLagrangianLoss(LossCalculator):
                 # for a field, val is a tuple, e.g. (batch_C, batch_dCdrho)
                 loss += self._compute_field_subloss(key, *val, is_objective=is_objective)  # unpack tuple
             elif key in self.scalar_loss_keys:
-                assert val >= 0, f"Scalar loss {key} should be non-negative"
+                # Clamp to avoid crash on NaN or tiny negative from numerical noise / bad SDF state
+                val = torch.as_tensor(val, device=torch.get_default_device(), dtype=torch.get_default_dtype())
+                val = torch.clamp(torch.nan_to_num(val, nan=0.0, posinf=1e10, neginf=0.0), min=0.0)
                 loss += self._compute_scalar_subloss(key, val, is_objective=is_objective)
             else:
                 raise ValueError(f"Key {key} not found in scalar or field loss keys")

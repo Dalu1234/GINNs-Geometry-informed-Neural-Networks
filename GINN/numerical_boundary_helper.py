@@ -69,8 +69,15 @@ class NumericalBoundaryHelper:
             if not success:
                 return None, None
             
-        # continue normally
-        dist = torch.min(torch.norm(p_surface.data[:, None, :] - self.x_interface[None, :, :], dim=2), dim=1)[0]
+        # continue normally: min distance from each surface point to interface (chunked to avoid GPU OOM)
+        _chunk = 32 * 1024  # ~32k rows at a time to stay under ~1GB for (chunk, n_interface)
+        n_surf = p_surface.data.shape[0]
+        dist_list = []
+        for start in range(0, n_surf, _chunk):
+            end = min(start + _chunk, n_surf)
+            d = torch.norm(p_surface.data[start:end, None, :] - self.x_interface[None, :, :], dim=2)
+            dist_list.append(d.min(dim=1)[0])
+        dist = torch.cat(dist_list, dim=0)
 
         if plot:
             p_surface_plot = p_surface.select_w_shapes(incl_shapes=np.arange(min(len(z), plot_max_shapes)))

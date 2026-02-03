@@ -135,7 +135,16 @@ class Plotter3d():
         
 
     def plot_shape(self, fig_label='Boundary', constraint_pts_dict={}, is_validation=False):
-        shape_grid = 1.5*(self.bounds[:,1] - self.bounds[:,0]) ## distance between the shape grid for plotting
+        if is_validation and len(self.meshes) > 0:
+            # Use max extent over all meshes so different-sized shapes (e.g. 1x1 vs 1x4 LEGO) don't overlap
+            extents = []
+            for verts, _ in self.meshes:
+                v = np.asarray(verts)
+                extents.append(v.max(axis=0) - v.min(axis=0))
+            extent = np.max(extents, axis=0)
+            shape_grid = 1.5 * extent
+        else:
+            shape_grid = 1.5*(self.bounds[:,1] - self.bounds[:,0]) ## distance between the shape grid for plotting
 
         if is_validation:
             n_rows, n_cols = self.val_plot_grid

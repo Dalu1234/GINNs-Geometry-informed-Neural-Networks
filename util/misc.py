@@ -119,7 +119,18 @@ def get_model(model_str, nx, nz, layers, ny=1, activation=None, w0=None, w0_init
               wire_scale=None, n_ffeat=None, ffn_sigma=None, **kwargs):
     
     act = get_activation(activation)
-    layers.insert(0, nx + nz)  ## input layer
+    # cond_wire extras (LEGO): tiled coords (+2), dist_to_edge_x (+1)
+    use_tiled_coords = kwargs.get('use_tiled_coords', False)
+    use_dist_to_edge = kwargs.get('use_dist_to_edge', False)
+    n_studs_vals = kwargs.get('n_studs_values') or []
+    use_dist_to_edge = use_dist_to_edge and (model_str == 'cond_wire') and (n_studs_vals is not None and len(n_studs_vals) > 0)
+    input_size = nx + nz
+    if model_str == 'cond_wire':
+        if use_tiled_coords:
+            input_size += 2
+        if use_dist_to_edge:
+            input_size += 1
+    layers.insert(0, input_size)
     layers.append(ny)  ## output layer
 
     if model_str == 'siren':
@@ -134,7 +145,12 @@ def get_model(model_str, nx, nz, layers, ny=1, activation=None, w0=None, w0_init
     elif model_str == 'comod_siren':
         model = LatentModulatedSiren(layers=layers, w0=w0, w0_initial=w0_initial, latent_dim=nz)
     elif model_str == 'cond_wire':
-        model = ConditionalWIRE(layers=layers, first_omega_0=w0_initial, hidden_omega_0=w0, scale=wire_scale, **kwargs)  # kwargs to pass legacy arguments
+        wire_kw = dict(kwargs)
+        if 'stud_spacing_normalized' in wire_kw:
+            wire_kw['stud_spacing'] = wire_kw.pop('stud_spacing_normalized', 1.0)
+        if 'stud_spacing_y_normalized' in wire_kw:
+            wire_kw['stud_spacing_y'] = wire_kw.pop('stud_spacing_y_normalized')
+        model = ConditionalWIRE(layers=layers, first_omega_0=w0_initial, hidden_omega_0=w0, scale=wire_scale, **wire_kw)
     elif model_str == 'grid_mock':
         model = ConditionalGridMock(**kwargs)
     elif model_str == 'general_net':
@@ -176,8 +192,13 @@ def compute_grad_norm(parameters):
     Computes the norm of the gradients of the parameters.
     Args:
         parameters (iterable): An iterable of torch.Tensor containing the parameters of the model.
-    """        
-    grads = [param.grad.detach().flatten() for param in parameters if param.grad is not None ]
+    """
+    params_list = list(parameters)
+    grads = [param.grad.detach().flatten() for param in params_list if param.grad is not None]
+    if len(grads) == 0:
+        device = params_list[0].device if params_list else None
+        dtype = params_list[0].dtype if params_list else torch.get_default_dtype()
+        return torch.tensor(0.0, device=device, dtype=dtype)
     grad_norm = torch.cat(grads).norm()
     return grad_norm
 

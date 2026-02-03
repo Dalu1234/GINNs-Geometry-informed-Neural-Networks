@@ -4,7 +4,7 @@ LEGO 1xN / NxN Brick Problem for GINN
 A parametric LEGO brick with N studs in a row (1xN) or a grid of studs (NxN).
 Standard LEGO dimensions (in mm, then normalized):
 - Stud diameter: 4.8mm
-- Stud height: 1.8mm  
+- Stud height: 1.7mm (commonly cited; was 1.8)
 - Stud spacing: 8.0mm (center to center)
 - Brick height: 9.6mm (without stud)
 - Brick width: 7.8mm (for 1-wide)
@@ -101,12 +101,12 @@ class ProblemLego1xN(ProblemBase):
     - Domain: Interior can have material
     """
     
-    # Standard LEGO dimensions in mm
+    # Standard LEGO dimensions in mm (per common specs: Brick Owl, Orion, LUGNET)
     STUD_DIAMETER = 4.8
-    STUD_HEIGHT = 1.8
-    STUD_SPACING = 8.0
-    BRICK_HEIGHT = 9.6  # Without stud
-    BRICK_WIDTH = 7.8   # 1-wide brick
+    STUD_HEIGHT = 1.7   # was 1.8; 1.7 mm is the commonly cited value
+    STUD_SPACING = 8.0  # center-to-center pitch (8 mm standard; ~7.986 at 25°C)
+    BRICK_HEIGHT = 9.6  # body height without stud
+    BRICK_WIDTH = 7.8   # 1-wide brick (8 - 0.2)
     
     def __init__(self, 
                  nx,
@@ -374,6 +374,26 @@ class ProblemLego1xN(ProblemBase):
         print(f"  Bounds: {self.bounds.tolist()}")
         print(f"  Stud centers: {len(stud_centers_norm)} studs")
         print(f"  Points: {len(pts_far_outside)} far_outside, {len(pts_outside)} outside, {len(pts_around_interface)} around_if, {len(pts_inside)} inside, {len(interface_pts)} interface, 6 walls")
+    
+    def sample_from_interface(self):
+        """Override: allocate more interface points to studs (tops + sides) so the interface loss
+        is not dominated by walls. Base splits n_points_interfaces equally across 7 constraints
+        (1 stud + 6 walls) -> only 1/7 on studs. Here we use 50% studs, 50% walls so studs get
+        a strong enough gradient to form."""
+        n_stud = self.n_points_interfaces // 2  # half to studs (tops + sides)
+        n_wall_total = self.n_points_interfaces - n_stud
+        wall_constraints = self._interface_constraints[1:]
+        pts_per_wall = max(1, n_wall_total // len(wall_constraints))
+        pts = []
+        normals = []
+        pts_stud, normals_stud = self._interface_constraints[0].get_sampled_points(n_stud)
+        pts.append(pts_stud)
+        normals.append(normals_stud)
+        for c in wall_constraints:
+            pts_i, normals_i = c.get_sampled_points(pts_per_wall)
+            pts.append(pts_i)
+            normals.append(normals_i)
+        return torch.cat(pts, dim=0), torch.cat(normals, dim=0)
     
     def _sample_far_outside_brick(self, bounds, expansion_factor, n_samples):
         """Sample points FAR outside the brick (like SimJEB's pts_far_outside)."""
