@@ -164,3 +164,30 @@ class NetWithPartials:
                 res.append(y)
                 
         return torch.cat(res, dim=0)
+
+    # Chunk sizes for forward with grad to avoid OOM on 8GB GPU (conservative for stability)
+    GROUPED_FWD_CHUNK = 1024       # plain vf
+    GROUPED_FWD_CHUNK_JAC = 128    # vf_x / vf_xx (Jacobian/Hessian are much heavier)
+
+    def grouped_fwd(self, f_str, x, z):
+        """Chunked forward with grad. Use for loss path when (x,z) batch is large to avoid vmap OOM."""
+        assert f_str in ['vf', 'vf_x', 'vf_xx', 'vf_z'], f_str
+        if f_str == 'vf':
+            func = self.vf_
+            chunk = self.GROUPED_FWD_CHUNK
+        elif f_str == 'vf_x':
+            func = self.vf_x_
+            chunk = max(1, self.GROUPED_FWD_CHUNK_JAC // self.nx)
+        elif f_str == 'vf_xx':
+            func = self.vf_xx_
+            chunk = max(1, self.GROUPED_FWD_CHUNK_JAC // (self.nx * self.nx))
+        else:
+            func = self.vf_z_
+            chunk = max(1, self.GROUPED_FWD_CHUNK // self.nz)
+        if chunk >= x.shape[0]:
+            return func(self.params, x, z)
+        res = []
+        for i in range(0, x.shape[0], chunk):
+            end = min(i + chunk, x.shape[0])
+            res.append(func(self.params, x[i:end], z[i:end]))
+        return torch.cat(res, dim=0)

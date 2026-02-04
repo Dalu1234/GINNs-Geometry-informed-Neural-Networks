@@ -7,7 +7,10 @@ import cripser
 import math
 
 from zmq import device
-from GINN.ph.ph_distributed import calc_3d_ph_4d_array, calc_3d_ph_4d_array_full
+import functools
+# Use torch-free worker module so pool workers never import torch (avoids hang on Windows spawn).
+from GINN.ph.ph_worker import calc_3d_ph_4d_array, calc_3d_ph_4d_array_full
+from GINN.ph.ph_distributed import LOSS_FUNC_REGISTRY
 from GINN.speed.timer import Timer
 from GINN.speed.dummy_async_res import DummyAsyncResult
 from GINN.speed.mp_manager import MPManager
@@ -174,7 +177,7 @@ class PHManager():
         with Timer.record('PH loss computation'):
             penalty_tuples_list = [res.get() for res in penalty_tuples_list]
 
-        # unpack the tuples
+        # unpack the tuples; workers return loss_spec_list (func_name, kwargs), resolve to loss_func_list here
         x_list = []
         z_list = []
         loss_key_list = []
@@ -184,7 +187,9 @@ class PHManager():
             x_list.extend(list_tuples[0])
             z_list.extend(list_tuples[1])
             loss_key_list.extend(list_tuples[2])
-            loss_func_list.extend(list_tuples[3])
+            # loss_spec_list: list of (func_name, kwargs) from torch-free worker
+            for func_name, kwargs in list_tuples[3]:
+                loss_func_list.append(functools.partial(LOSS_FUNC_REGISTRY[func_name], **kwargs))
     
         x_idcs = torch.from_numpy(np.concatenate(x_list)).to(self.xs.device)
         if len(x_idcs) == 0:

@@ -13,20 +13,35 @@ from GINN.fenitop.heaviside_filter import heaviside
 from models.net_w_partials import NetWithPartials
 from models.point_wrapper import PointWrapper
 from util.model_utils import tensor_product_xz
-from train.losses import CD_dCDdy_loss, chamfer_diversity_loss, diversity_loss, dirichlet_loss, envelope_loss_density, expression_curvature_loss, interface_loss, eikonal_loss, envelope_loss_sdf, l1_loss, mse_loss, normal_loss_euclidean, wasserstein_diversity_loss
+from train.losses import CD_dCDdy_loss, chamfer_diversity_loss, cuboid_rule_loss_sdf, diversity_loss, dirichlet_loss, envelope_loss_density, expression_curvature_loss, interface_loss, eikonal_loss, envelope_loss_sdf, l1_loss, mse_loss, normal_loss_euclidean, wasserstein_diversity_loss
 
 Scalar: typing.TypeAlias = torch.Tensor #TODO: need to implement this more rigorously using torchtypeing https://github.com/patrick-kidger/torchtyping
 Grad_Field: typing.TypeAlias = torch.Tensor
 
+
+# =============================================================================
+# EIKONAL LOSS
+# Purpose: Make the network output a valid SDF (signed distance function)
+# How: The gradient of a true SDF has magnitude 1 everywhere (||∇f|| = 1)
+# Penalizes: (||∇f|| - 1)² at random points in the domain
+# =============================================================================
 def loss_eikonal(z, p_sampler, netp, scale_eikonal, **kwargs) -> Scalar:
     loss_eikonal = torch.tensor(0.0, device=z.device, dtype=z.dtype)
     xs_domain = p_sampler.sample_from_domain()
-        ## Eikonal loss: NN should have gradient norm 1 everywhere
-    y_x_eikonal = netp.vf_x(*tensor_product_xz(xs_domain, z))
+    ## Eikonal loss: NN should have gradient norm 1 everywhere
+    x_tp, z_tp = tensor_product_xz(xs_domain, z)
+    y_x_eikonal = netp.grouped_fwd('vf_x', x_tp, z_tp)
     loss_eikonal = eikonal_loss(y_x_eikonal)
     loss_eikonal = scale_eikonal * loss_eikonal
     return loss_eikonal
 
+
+# =============================================================================
+# OBSTACLE LOSS
+# Purpose: Keep shape OUTSIDE of forbidden obstacle regions
+# How: At points inside obstacles, push f > 0 (exterior)
+# Penalizes: ReLU(-f) — only activates when f < 0 (incorrectly inside)
+# =============================================================================
 def loss_obst(z, netp, p_sampler, level_set, nf_is_density, **kwargs) -> Scalar:
     loss_obst = torch.tensor(0.0, device=z.device, dtype=z.dtype)
     ys_obst = netp(*tensor_product_xz(p_sampler.sample_from_obstacles(), z))
@@ -36,6 +51,15 @@ def loss_obst(z, netp, p_sampler, level_set, nf_is_density, **kwargs) -> Scalar:
         loss_obst = envelope_loss_sdf(ys_obst, level_set=level_set)
     return loss_obst
 
+
+
+#DALU SAY GET RID OF 
+# =============================================================================
+# ENVELOPE LOSS
+# Purpose: Keep shape INSIDE the bounding box / allowed region
+# How: At points outside the envelope, push f > 0 (exterior)
+# Penalizes: ReLU(-f) — only activates when f < 0 (shape leaks outside bounds)
+# =============================================================================
 def loss_env(z, netp, p_sampler, level_set, nf_is_density, **kwargs) -> Scalar:
     loss_env = torch.tensor(0.0, device=z.device, dtype=z.dtype)
     ys_env = netp(*tensor_product_xz(p_sampler.sample_from_envelope(), z)).squeeze(1)
@@ -45,14 +69,143 @@ def loss_env(z, netp, p_sampler, level_set, nf_is_density, **kwargs) -> Scalar:
         loss_env = envelope_loss_sdf(ys_env)
     return loss_env
 
+#DALU SAY GET RID OF 
+# =============================================================================
+# INTERFACE LOSS
+# Purpose: Place the zero-level set at the target surface
+# How: At points sampled from the target mesh surface, push f = 0
+# Penalizes: MSE(f, 0) — surface should be exactly at these points
+# Note: This is SHAPE-encoding, not RULE-encoding (memorizes pointcloud)
+# =============================================================================
 def loss_if(z, netp, p_sampler, level_set, **kwargs) -> Scalar:
     ys_BC = netp(*tensor_product_xz(p_sampler.sample_from_interface()[0], z)).squeeze(1)
     loss_if = interface_loss(ys_BC, level_set=level_set)
     return loss_if
 
+
+# =============================================================================
+# CUBOID PRIMITIVE LOSS (RULE-BASED)
+# Purpose: Teach the network what a box IS, not memorize specific surfaces
+# How: 
+#   1. Inside box → f < -margin (safely inside)
+#   2. Near faces → f > +margin (safely outside)  
+#   3. Corners → f > +margin (safely outside)
+#   4. Far field → f > +margin (safely outside)
+#   5. Boundary sharpening → f ≈ true_distance near faces
+# Note: This IS rule-encoding — learns "box = negative inside, positive outside"
+# =============================================================================
+def loss_cuboid_primitive(z, netp, bounds, n_inside=2000, n_near_faces=1000, 
+                          n_corners=500, n_far=500, n_boundary=1000,
+                          safety_margin=0.1, boundary_weight=0.5, **kwargs) -> Scalar:
+    """
+    Teach: A cuboid is a region where f < 0 inside a box, f > 0 outside.
+    Uses stratified sampling and boundary sharpening for better learning.
+    
+    Args:
+        z: latent codes (B, nz)
+        netp: network with partials
+        bounds: (3, 2) tensor [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+        n_inside: points inside box
+        n_near_faces: points just outside each face
+        n_corners: points near box corners
+        n_far: points far from box
+        n_boundary: points on/near faces for SDF supervision
+        safety_margin: how far inside/outside to enforce
+        boundary_weight: weight for boundary sharpening term
+    """
+    from GINN.problems.sampling_primitives import (
+        sample_inside_box, sample_near_box_faces, sample_near_box_corners,
+        sample_far_from_box, sample_on_box_faces_with_sdf
+    )
+    
+    device = z.device
+    dtype = z.dtype
+    
+    # =========================================================================
+    # 1. INSIDE: should be f < -safety_margin (safely inside)
+    # =========================================================================
+    x_inside = sample_inside_box(bounds, n_inside, margin=0.0)
+    x_in_tp, z_in_tp = tensor_product_xz(x_inside, z)
+    f_inside = netp.grouped_fwd('vf', x_in_tp, z_in_tp).squeeze(-1)
+    # Penalize when f > -safety_margin (should be < -margin, i.e. safely negative)
+    loss_inside = torch.relu(f_inside + safety_margin).mean()
+    
+    # =========================================================================
+    # 2. NEAR FACES: should be f > +safety_margin (safely outside)
+    # =========================================================================
+    x_near_faces = sample_near_box_faces(bounds, margin=0.2, n=n_near_faces)
+    x_faces_tp, z_faces_tp = tensor_product_xz(x_near_faces, z)
+    f_near_faces = netp.grouped_fwd('vf', x_faces_tp, z_faces_tp).squeeze(-1)
+    # Penalize when f < +safety_margin (should be > +margin, i.e. safely positive)
+    loss_near_faces = torch.relu(safety_margin - f_near_faces).mean()
+    
+    # =========================================================================
+    # 3. CORNERS: should be f > +safety_margin (safely outside)
+    # =========================================================================
+    x_corners = sample_near_box_corners(bounds, margin=0.3, n=n_corners)
+    x_corners_tp, z_corners_tp = tensor_product_xz(x_corners, z)
+    f_corners = netp.grouped_fwd('vf', x_corners_tp, z_corners_tp).squeeze(-1)
+    loss_corners = torch.relu(safety_margin - f_corners).mean()
+    
+    # =========================================================================
+    # 4. FAR FIELD: should be f > +safety_margin (safely outside)
+    # =========================================================================
+    x_far = sample_far_from_box(bounds, margin_range=(1.0, 2.0), n=n_far)
+    if x_far.shape[0] > 0:
+        x_far_tp, z_far_tp = tensor_product_xz(x_far, z)
+        f_far = netp.grouped_fwd('vf', x_far_tp, z_far_tp).squeeze(-1)
+        loss_far = torch.relu(safety_margin - f_far).mean()
+    else:
+        loss_far = torch.tensor(0.0, device=device, dtype=dtype)
+    
+    # =========================================================================
+    # 5. BOUNDARY SHARPENING: f ≈ true_distance near faces
+    # This teaches the network that SDF equals actual distance to surface
+    # =========================================================================
+    x_boundary, true_sdf = sample_on_box_faces_with_sdf(bounds, n_boundary)
+    x_bound_tp, z_bound_tp = tensor_product_xz(x_boundary, z)
+    f_boundary = netp.grouped_fwd('vf', x_bound_tp, z_bound_tp).squeeze(-1)
+    # Supervised loss: f should match true SDF
+    loss_boundary = (f_boundary - true_sdf.repeat(z.shape[0])).pow(2).mean()
+    
+    # =========================================================================
+    # COMBINE
+    # =========================================================================
+    loss_outside = loss_near_faces + loss_corners + loss_far
+    total_loss = loss_inside + loss_outside + boundary_weight * loss_boundary
+    
+    return total_loss
+
+
+# Keep old loss_cuboid_rule for backward compatibility (deprecated)
+def loss_cuboid_rule(z, netp, p_sampler, level_set, nf_is_density, **kwargs) -> Scalar:
+    """
+    DEPRECATED: Use loss_cuboid_primitive instead.
+    This version uses simple inside/outside sampling without stratification or boundary sharpening.
+    """
+    if nf_is_density:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    x_inside = p_sampler.sample_from_inside_envelope()
+    x_outside = p_sampler.sample_from_envelope()
+    x_in_tp, z_in_tp = tensor_product_xz(x_inside, z)
+    x_out_tp, z_out_tp = tensor_product_xz(x_outside, z)
+    ys_inside = netp.grouped_fwd('vf', x_in_tp, z_in_tp).squeeze(1)
+    ys_outside = netp.grouped_fwd('vf', x_out_tp, z_out_tp).squeeze(1)
+    return cuboid_rule_loss_sdf(ys_inside, ys_outside, level_set=level_set)
+
+
+#DALU SAY GET RID OF 
+# =============================================================================
+# INTERFACE NORMAL LOSS
+# Purpose: Make surface normals match target geometry
+# How: At surface points, gradient ∇f should equal the mesh normal
+# Penalizes: ||∇f - target_normal||² (Euclidean distance)
+# Note: This is SHAPE-encoding — normals come from mesh, not from rules
+# =============================================================================
 def loss_if_normal(z, netp, p_sampler, nf_is_density, loss_scale, ginn_bsize=None, **kwargs) -> Scalar:
     pts_normal, target_normal = p_sampler.sample_from_interface()
-    ys_normal = netp.vf_x(*tensor_product_xz(pts_normal, z)).squeeze(1)
+    x_tp, z_tp = tensor_product_xz(pts_normal, z)
+    ys_normal = netp.grouped_fwd('vf_x', x_tp, z_tp).squeeze(1)
     
     if nf_is_density:
         # if the neural field is a density field, make normal vectors unit vectors
@@ -62,6 +215,113 @@ def loss_if_normal(z, netp, p_sampler, nf_is_density, loss_scale, ginn_bsize=Non
     loss_if_normal = loss_scale * loss_if_normal
     return loss_if_normal
 
+
+# =============================================================================
+# LATENT STRUCTURE LOSS
+# Purpose: Keep latent space healthy — not collapsed, not exploded, meaningful
+# How: Three components:
+#   1. Variance: z should have variance (prevent collapse to same point)
+#   2. Magnitude: z should be bounded (prevent explosion)
+#   3. Diversity: different z should give different SDFs (optional)
+# Note: Cleaner alternative to separate prior/diversity losses
+# =============================================================================
+def loss_latent_structure(z, netp, p_sampler, 
+                          min_variance=0.1, max_magnitude=3.0,
+                          diversity_weight=1.0, n_diversity_pts=100,
+                          **kwargs) -> Scalar:
+    """
+    Encourage latent space to have meaningful structure.
+    
+    NOT a VAE prior - just basic regularization to keep z healthy.
+    
+    Args:
+        z: latent codes (B, nz) - includes z_base and conditioning cols
+        netp: network with partials
+        p_sampler: problem for getting bounds
+        min_variance: minimum variance per z dimension (prevent collapse)
+        max_magnitude: maximum |z| per dimension (prevent explosion)
+        diversity_weight: weight for SDF diversity term
+        n_diversity_pts: number of points for SDF comparison
+    """
+    device = z.device
+    dtype = z.dtype
+    B = z.shape[0]
+    
+    # =========================================================================
+    # 1. VARIANCE: Prevent collapse — z should spread out, not cluster
+    # =========================================================================
+    # Penalize if variance is below threshold
+    z_var = z.var(dim=0)  # Variance per dimension
+    loss_variance = torch.relu(min_variance - z_var).mean()
+    
+    # =========================================================================
+    # 2. MAGNITUDE: Prevent explosion — z should stay bounded
+    # =========================================================================
+    # Penalize if |z| exceeds threshold
+    loss_magnitude = torch.relu(z.abs() - max_magnitude).mean()
+    
+    # =========================================================================
+    # 3. DIVERSITY: Different z should produce different SDFs
+    # =========================================================================
+    loss_diversity = torch.tensor(0.0, device=device, dtype=dtype)
+    
+    if B > 1 and diversity_weight > 0:
+        # Sample points in domain
+        bounds = p_sampler.bounds
+        x_sample = bounds[:, 0] + (bounds[:, 1] - bounds[:, 0]) * torch.rand(n_diversity_pts, 3, device=device)
+        
+        # Evaluate SDF at sample points for each z
+        sdfs = []
+        for i in range(B):
+            z_i = z[i:i+1].expand(n_diversity_pts, -1)
+            with torch.no_grad():
+                sdf_i = netp.grouped_fwd('vf', x_sample, z_i).squeeze(-1)
+            sdfs.append(sdf_i)
+        
+        sdfs = torch.stack(sdfs)  # [B, n_diversity_pts]
+        
+        # Different z should give different SDF values at same points
+        # Variance across batch dimension at each point
+        sdf_variance = sdfs.var(dim=0).mean()  # Average variance across points
+        
+        # Penalize if SDF variance is too low (all z give same shape)
+        loss_diversity = torch.relu(0.01 - sdf_variance) * diversity_weight
+    
+    # =========================================================================
+    # COMBINE
+    # =========================================================================
+    total_loss = loss_variance + loss_magnitude + loss_diversity
+    
+    return total_loss
+
+
+# =============================================================================
+# PRIOR LOSS
+# Purpose: Learn a conditional distribution over latent codes p(z | c)
+# How: Fit a small network to predict mean/std of z given conditioning c
+# Penalizes: -log p(z_base | c) — negative log likelihood
+# Use: Enables sampling z from learned prior at inference time
+# =============================================================================
+def loss_prior(z, conditional_prior, nz_base, c_dim, **kwargs) -> Scalar:
+    """
+    Negative log probability of z_base under the conditional prior p(z_base | c).
+    Fits the prior to assign high density to the z_base we use (learns a latent prior per condition).
+    """
+    if z.shape[1] < nz_base + c_dim:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    z_base = z[:, :nz_base]
+    c = z[:, -c_dim:].clamp(0.0, 1.0)
+    log_p = conditional_prior.log_prob(z_base, c)
+    return -log_p.mean()
+
+
+# =============================================================================
+# SCC LOSS (Single Connected Component)
+# Purpose: Ensure shape is ONE piece, not fragmented blobs
+# How: Uses persistent homology (PH) to count connected components
+# Penalizes: Having more than 1 connected component (Betti_0 > 1)
+# Result: Pushes network to output a single connected mesh
+# =============================================================================
 def loss_scc(z, ph_manager, **kwargs) -> Scalar:
     loss_scc = torch.tensor(0.0, device=z.device, dtype=z.dtype)
     loss_sub0 = torch.tensor(0.0, device=z.device, dtype=z.dtype)
@@ -69,6 +329,14 @@ def loss_scc(z, ph_manager, **kwargs) -> Scalar:
     success, loss_scc, loss_super0, loss_sub0 = ph_manager.calc_ph_loss_cripser(z)
     return loss_scc
 
+
+# =============================================================================
+# DATA LOSS
+# Purpose: Fit network to ground-truth SDF samples (supervised)
+# How: For (x, y_gt) pairs from dataset, minimize MSE(f(x), y_gt)
+# Use: Only when lambda_data > 0 and you have GT SDF samples
+# Note: NOT used in pure GINN (constraint-only training)
+# =============================================================================
 def loss_data(z, netp, batch, z_corners, **kwargs) -> Scalar:
     loss_data = torch.tensor(0.0, device=z_corners.device, dtype=z_corners.dtype)
     x, y, idcs = batch
@@ -79,6 +347,14 @@ def loss_data(z, netp, batch, z_corners, **kwargs) -> Scalar:
 
     return loss_data
 
+
+# =============================================================================
+# DIRICHLET LOSS
+# Purpose: Penalize how much the SDF changes with respect to z (latent)
+# How: Compute ∂f/∂z and minimize its magnitude
+# Effect: Different z values give similar shapes (reduces diversity)
+# Use: Rarely used; conflicts with diversity loss
+# =============================================================================
 def loss_dirichlet(z, netp, p_surface, p_sampler, batch, **kwargs) -> Scalar:
     '''Uses surface points to enforce Dirichlet energy'''
     l_dirich =  torch.tensor(0.0, device=z.device, dtype=z.dtype)
@@ -90,12 +366,28 @@ def loss_dirichlet(z, netp, p_surface, p_sampler, batch, **kwargs) -> Scalar:
     l_dirich = dirichlet_loss(y_z)
     return l_dirich
 
+
+# =============================================================================
+# LIPSCHITZ LOSS
+# Purpose: Regularize network to be Lipschitz continuous
+# How: Penalize large weight norms or spectral norms
+# Effect: Smoother SDF, more stable gradients
+# Use: For Lipschitz-constrained architectures (lip_mlp, lip_siren)
+# =============================================================================
 def loss_lip(z, netp, **kwargs) -> Scalar:
     loss_lip = torch.tensor(0.0, device=z.device, dtype=z.dtype)
     loss_lip = netp.get_lipschitz_loss()
 
     return loss_lip
 
+
+# =============================================================================
+# VOLUME LOSS
+# Purpose: Constrain total volume of shape to target fraction
+# How: Integrate density field, penalize deviation from vol_frac
+# Penalizes: (actual_vol / target_vol - 1)²
+# Use: Topology optimization (TO) problems
+# =============================================================================
 def loss_vol2(rho_batch, vol_frac, nf_is_density, beta, **kwargs) -> Scalar:
     print(f'WARNING: vol2 heaviside is hardcoded to 128')
     rho_batch_vol = heaviside(rho_batch, beta, nf_is_density)
@@ -104,8 +396,14 @@ def loss_vol2(rho_batch, vol_frac, nf_is_density, beta, **kwargs) -> Scalar:
     vol_loss_2 = torch.clip(vol_loss_2, min=0.).mean()
     return vol_loss_2
 
-# DIV LOSS
 
+# =============================================================================
+# CHAMFER DIVERSITY LOSS
+# Purpose: Encourage different z → different shapes
+# How: Compute Chamfer distance between surface points of different shapes
+# Penalizes: Small distance between shapes (pushes them apart)
+# Use: Generative mode — want variety in output shapes
+# =============================================================================
 def loss_chamfer_div(z, netp: NetWithPartials, p_surface: PointWrapper, subsample, chamfer_p, max_div, chamfer_div_eps, loss_scale, **kwargs) -> Scalar:
     
     print(f'Total len of surface points: {len(p_surface)}')

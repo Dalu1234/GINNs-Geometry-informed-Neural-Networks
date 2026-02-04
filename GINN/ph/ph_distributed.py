@@ -213,3 +213,14 @@ def filter_PH_sub_iso(PHd: np.ndarray, lengthsd: np.ndarray, iso: float):
 def filter_PH_inf_death(PHd: np.ndarray, lengthsd: np.ndarray):
     is_iso = (PHd[:,2] < 1.e100)
     return PHd[is_iso], lengthsd[is_iso]
+
+
+# Registry for PH loss functions so pool workers can return (func_name, kwargs) and main process resolves (avoids torch in workers on Windows).
+LOSS_FUNC_REGISTRY = {
+    "loss_scc_dim_0": loss_scc_dim_0,
+    "loss_super_dim_0": loss_super_dim_0,
+    "loss_sub_dim_0": loss_sub_dim_0,
+    "loss_scc_dim_1_neg": loss_scc_dim_1_neg,
+    "loss_scc_dim_1_pos": loss_scc_dim_1_pos,
+    "loss_scc_dim_1": loss_scc_dim_1,
+}

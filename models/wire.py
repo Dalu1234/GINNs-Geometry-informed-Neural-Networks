@@ -184,6 +184,8 @@ class ConditionalWIRE(nn.Module):
     sees position within each tile and can learn one cylindrical feature per tile.
     Optional dist_to_edge_x: append signed distance to nearest x-boundary (positive inside brick)
     so the network can ignore phantom studs outside the brick (e.g. dist_to_edge_x < 0).
+    Optional hypernetwork: LoRA-style weight deltas on the last linear, conditioned on c = (Nx_norm, Ny_norm, height_norm)
+    to reduce gradient interference across brick types and support unseen bricks.
     '''
     def __init__(self, 
                  layers: List[int],
@@ -198,6 +200,11 @@ class ConditionalWIRE(nn.Module):
                  use_dist_to_edge=False,
                  n_studs_values=None,
                  n_norm_col=2,
+                 use_hypernet=False,
+                 lora_rank=4,
+                 c_dim=3,
+                 hypernet_hidden=(32, 32),
+                 lora_init_scale=0.01,
                  **kwargs):
         super().__init__()
         self.layers = layers
@@ -212,7 +219,9 @@ class ConditionalWIRE(nn.Module):
         self.use_dist_to_edge = use_dist_to_edge and (n_studs_values is not None and len(n_studs_values) > 0)
         self.n_studs_values = list(n_studs_values) if n_studs_values is not None else []
         self.n_norm_col = n_norm_col
-        
+        self.use_hypernet = use_hypernet
+        self.c_dim = c_dim
+
         # All results in the paper were with the default complex 'gabor' nonlinearity
         # NOTE: I used partial(RelGaborLayer, omega0=first_omega_0, sigma0=scale) to set the default values, but there was some weird behavior. 
         if use_legacy_gabor:
@@ -242,8 +251,53 @@ class ConditionalWIRE(nn.Module):
             self.net.append(nn.Sigmoid())
         
         self.net = nn.Sequential(*self.net)
-    
+
+        # Optional: LoRA on last two layers (penult Gabor's Linear + final Linear) for more expressivity
+        if use_hypernet:
+            from models.hypernetwork_lora import MultiLayerHypernetworkLoRA
+            net_list = list(self.net)
+            # Backbone: all but last two (penult Gabor + final Linear); if return_density, net ends with Sigmoid so drop 3
+            n_tail = 3 if self.return_density else 2
+            self._backbone = nn.Sequential(*(net_list[:-n_tail]))
+            self._penult_gabor = self.net[-3] if self.return_density else self.net[-2]
+            self._final_linear = self.net[-2] if self.return_density else self.net[-1]
+            # Penult Gabor has freq_scale: Linear(layers[-2], 2*layers[-2]); final is Linear(layers[-2], layers[-1])
+            penult_out = 2 * layers[-2]  # RealGaborLayer uses 2*out_features in freq_scale
+            layer_specs = [
+                (penult_out, layers[-2]),   # LoRA for Gabor's freq_scale (256 -> 512)
+                (layers[-1], layers[-2]),   # LoRA for final linear (256 -> 1)
+            ]
+            self.hypernet = MultiLayerHypernetworkLoRA(
+                c_dim=c_dim,
+                layer_specs=layer_specs,
+                rank=lora_rank,
+                hidden_dims=hypernet_hidden,
+                init_scale=lora_init_scale,
+            )
+
+    # Chunk size for LoRA bmm to avoid OOM when batch is large (e.g. tensor_product_xz with 70k+ rows)
+    LORA_BMM_CHUNK = 4096
+
+    def _chunked_lora_bmm(self, h, U, V):
+        """Compute h @ (U @ V).T over batch in chunks to avoid materializing full (B, out, in) on GPU."""
+        B = h.shape[0]
+        if B <= self.LORA_BMM_CHUNK:
+            uv = U @ V  # (B, out, in)
+            return torch.bmm(h, uv.transpose(1, 2))
+        out = []
+        for start in range(0, B, self.LORA_BMM_CHUNK):
+            end = min(start + self.LORA_BMM_CHUNK, B)
+            h_ch = h[start:end]
+            uv = U[start:end] @ V[start:end]
+            out.append(torch.bmm(h_ch, uv.transpose(1, 2)))
+        return torch.cat(out, dim=0)
+
     def forward(self, x, z):
+        # vmap (e.g. in recalc_output/get_mesh) calls with unbatched x (3,) and z (nz,); hypernet path needs batched z
+        unbatched = x.dim() == 1
+        if unbatched:
+            x = x.unsqueeze(0)
+            z = z.unsqueeze(0)
         if self.use_dist_to_edge:
             from util.model_utils import dist_to_edge_x_from_z
             dist_x = dist_to_edge_x_from_z(x, z, self.n_studs_values, self.n_norm_col)
@@ -252,5 +306,36 @@ class ConditionalWIRE(nn.Module):
             from util.model_utils import tile_coords_xy
             x = tile_coords_xy(x, period_x=self.stud_spacing_x, period_y=self.stud_spacing_y, center=True)
         xz = torch.cat([x, z], dim=-1)
+
+        if self.use_hypernet:
+            # Contract: last c_dim columns of z must be (Nx_norm, Ny_norm, height_norm)
+            assert z.shape[-1] >= self.c_dim, (
+                f"use_hypernet with c_dim={self.c_dim} requires z to have at least {self.c_dim} columns; got z.shape[-1]={z.shape[-1]}"
+            )
+            c = z[:, -self.c_dim:].clamp(0.0, 1.0)
+            lora_pairs = self.hypernet(c)  # list of (U, V) for penult and final
+            U1, V1 = lora_pairs[0]
+            U2, V2 = lora_pairs[1]
+
+            h = self._backbone(xz)  # (B, 256)
+            # Penult Gabor with LoRA: base_freq + (U1@V1)@h per sample -> (B, 512)
+            base_freq = self._penult_gabor.freq_scale(h)
+            # Chunked to avoid OOM: (U1@V1) is (B, 512, 256); full batch can be 70k+ on 8GB GPU
+            lora1 = self._chunked_lora_bmm(h.unsqueeze(1), U1, V1).squeeze(1)
+            freq_out = base_freq + lora1
+            omega, scale = torch.chunk(freq_out, 2, dim=-1)
+            h2 = torch.cos(self._penult_gabor.omega_0 * omega) * torch.exp(-(self._penult_gabor.scale_0 * scale ** 2))
+
+            y_base = self._final_linear(h2)
+            y_lora = self._chunked_lora_bmm(h2.unsqueeze(1), U2, V2).squeeze(-1)
+            output = y_base + y_lora
+            if self.return_density:
+                output = torch.sigmoid(output)
+            if unbatched:
+                output = output.squeeze(0)
+            return output
+
         output = self.net(xz)
+        if unbatched:
+            output = output.squeeze(0)
         return output

@@ -111,3 +111,188 @@ def sample_axis_parallel_rectangle_in_3d(start_xyz, end_xyz, N=50):
     bbox = torch.vstack([start_xyz, end_xyz]).T
     xs_bbox = sample_bbox(bbox, N=N)
     return xs_bbox
+
+
+# =============================================================================
+# BOX PRIMITIVE SAMPLING (for rule-based cuboid loss)
+# =============================================================================
+
+def sample_inside_box(bounds, n, margin=0.0):
+    """
+    Sample n points uniformly inside a 3D box.
+    
+    Args:
+        bounds: (3, 2) tensor [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+        n: number of points
+        margin: shrink box by this amount on each side (for "safely inside")
+    
+    Returns:
+        (n, 3) tensor of points
+    """
+    device = bounds.device
+    mins = bounds[:, 0] + margin
+    maxs = bounds[:, 1] - margin
+    pts = mins + (maxs - mins) * torch.rand(n, 3, device=device)
+    return pts
+
+
+def sample_near_box_faces(bounds, margin, n):
+    """
+    Sample n points in a shell just outside each face of the box.
+    
+    Args:
+        bounds: (3, 2) tensor
+        margin: distance from face (points are between face and face+margin)
+        n: total number of points (distributed across 6 faces)
+    """
+    device = bounds.device
+    pts_per_face = n // 6
+    pts_list = []
+    
+    for axis in range(3):
+        for side in [0, 1]:  # min face, max face
+            face_pts = torch.rand(pts_per_face, 3, device=device)
+            # Scale to box dimensions for non-axis dims
+            for d in range(3):
+                if d == axis:
+                    if side == 0:
+                        # Just outside min face
+                        face_pts[:, d] = bounds[d, 0] - margin * torch.rand(pts_per_face, device=device)
+                    else:
+                        # Just outside max face
+                        face_pts[:, d] = bounds[d, 1] + margin * torch.rand(pts_per_face, device=device)
+                else:
+                    face_pts[:, d] = bounds[d, 0] + (bounds[d, 1] - bounds[d, 0]) * face_pts[:, d]
+            pts_list.append(face_pts)
+    
+    return torch.cat(pts_list, dim=0)
+
+
+def sample_near_box_corners(bounds, margin, n):
+    """
+    Sample n points near the 8 corners of the box (outside).
+    
+    Args:
+        bounds: (3, 2) tensor
+        margin: distance from corner
+        n: total number of points
+    """
+    device = bounds.device
+    pts_per_corner = n // 8
+    pts_list = []
+    
+    for x_side in [0, 1]:
+        for y_side in [0, 1]:
+            for z_side in [0, 1]:
+                # Corner position
+                corner = torch.tensor([
+                    bounds[0, x_side],
+                    bounds[1, y_side],
+                    bounds[2, z_side]
+                ], device=device)
+                
+                # Direction outward from box
+                direction = torch.tensor([
+                    -1.0 if x_side == 0 else 1.0,
+                    -1.0 if y_side == 0 else 1.0,
+                    -1.0 if z_side == 0 else 1.0
+                ], device=device)
+                
+                # Sample in outward cone from corner
+                offsets = torch.rand(pts_per_corner, 3, device=device) * margin
+                offsets = offsets * direction.abs()  # Make positive
+                offsets = offsets * direction.sign()  # Apply direction
+                pts_list.append(corner + offsets)
+    
+    return torch.cat(pts_list, dim=0)
+
+
+def sample_far_from_box(bounds, margin_range, n):
+    """
+    Sample n points far outside the box (between margin_range[0] and margin_range[1]).
+    
+    Args:
+        bounds: (3, 2) tensor
+        margin_range: (min_dist, max_dist) from box surface
+        n: number of points
+    """
+    device = bounds.device
+    min_dist, max_dist = margin_range
+    
+    # Expand box by max_dist, then reject points too close
+    expanded_bounds = bounds.clone()
+    expanded_bounds[:, 0] -= max_dist
+    expanded_bounds[:, 1] += max_dist
+    
+    inner_bounds = bounds.clone()
+    inner_bounds[:, 0] -= min_dist
+    inner_bounds[:, 1] += min_dist
+    
+    # Oversample and reject
+    pts = sample_bbox(expanded_bounds, N=n * 3)
+    
+    # Keep only points outside inner_bounds (far enough from box)
+    inside_inner = (
+        (pts[:, 0] >= inner_bounds[0, 0]) & (pts[:, 0] <= inner_bounds[0, 1]) &
+        (pts[:, 1] >= inner_bounds[1, 0]) & (pts[:, 1] <= inner_bounds[1, 1]) &
+        (pts[:, 2] >= inner_bounds[2, 0]) & (pts[:, 2] <= inner_bounds[2, 1])
+    )
+    pts = pts[~inside_inner][:n]
+    
+    return pts
+
+
+def sample_on_box_faces_with_sdf(bounds, n):
+    """
+    Sample n points ON the 6 faces of the box, with their true SDF values (0 on surface).
+    Also returns points slightly inside and outside with their true SDF.
+    
+    Args:
+        bounds: (3, 2) tensor
+        n: total number of points
+    
+    Returns:
+        pts: (n, 3) points on and near faces
+        true_sdf: (n,) true signed distance (negative inside, positive outside)
+    """
+    device = bounds.device
+    pts_per_face = n // 6
+    pts_list = []
+    sdf_list = []
+    
+    for axis in range(3):
+        for side in [0, 1]:  # min face, max face
+            # Points on the face (SDF = 0)
+            n_on = pts_per_face // 3
+            n_inside = pts_per_face // 3
+            n_outside = pts_per_face - n_on - n_inside
+            
+            for offset, count, sdf_sign in [(0.0, n_on, 0.0), 
+                                             (-0.05, n_inside, -0.05),  # inside
+                                             (0.05, n_outside, 0.05)]:  # outside
+                face_pts = torch.rand(count, 3, device=device)
+                sdf_vals = torch.full((count,), abs(offset), device=device)
+                
+                for d in range(3):
+                    if d == axis:
+                        if side == 0:
+                            face_pts[:, d] = bounds[d, 0] - offset  # offset inward is negative
+                            sdf_vals = sdf_vals * (-1 if offset < 0 else 1)
+                        else:
+                            face_pts[:, d] = bounds[d, 1] + offset
+                            sdf_vals = sdf_vals * (-1 if offset < 0 else 1)
+                    else:
+                        face_pts[:, d] = bounds[d, 0] + (bounds[d, 1] - bounds[d, 0]) * face_pts[:, d]
+                
+                # True SDF for a box: distance to nearest face
+                # For points exactly on a face, SDF = 0
+                # For points offset from face, SDF = offset (with sign)
+                pts_list.append(face_pts)
+                if offset == 0:
+                    sdf_list.append(torch.zeros(count, device=device))
+                elif offset < 0:
+                    sdf_list.append(torch.full((count,), offset, device=device))
+                else:
+                    sdf_list.append(torch.full((count,), offset, device=device))
+    
+    return torch.cat(pts_list, dim=0), torch.cat(sdf_list, dim=0)

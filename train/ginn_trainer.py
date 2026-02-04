@@ -27,7 +27,7 @@ from GINN.ph.ph_manager import PHManager
 from GINN.speed.timer import Timer
 from train.train_utils.latent_sampler import LatentSampler
 from train.train_utils.violation_buffer import ViolationBuffer
-from util.checkpointing import load_model_optim_sched, save_model_every_n_epochs
+from util.checkpointing import load_model_optim_sched, load_conditional_prior, save_model_every_n_epochs
 from util.misc import combine_dicts, do_plot, get_model, get_problem, is_every_n_epochs_fulfilled
 from train.losses_ginn import *
 from train.losses_diversity import diversity_loss_chamfer, diversity_loss_contrastive, diversity_loss_volume_symmetric_difference, diversity_loss_combined
@@ -204,6 +204,23 @@ class Trainer():
                 eps=vb_cfg.get('eps', 1e-8),
             )
             self.logger.info(f'Violation buffer: {len(self.violation_buffer)} entries ({initial_size_per_c} per c_key)')
+
+        # Conditional latent prior p(z_base | c): learned per-condition distribution over shape latent
+        self.conditional_prior = None
+        self.nz_base_prior = None
+        self.c_dim_prior = None
+        if self.config.get('lambda_prior', 0) > 0 and (self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height):
+            from train.train_utils.conditional_prior import ConditionalPrior
+            self.nz_base_prior = self.config['latent_sampling']['nz']
+            self.c_dim_prior = (1 if self.condition_on_n_studs else 0) + (1 if self.condition_on_n_studs_y else 0) + (1 if self.condition_on_height else 0)
+            prior_hidden = self.config.get('prior_hidden', [32, 32])
+            self.conditional_prior = ConditionalPrior(
+                c_dim=self.c_dim_prior,
+                z_base_dim=self.nz_base_prior,
+                hidden_dims=prior_hidden,
+                min_sigma=self.config.get('prior_min_sigma', 1e-3),
+            )
+            self.logger.info(f'Conditional prior: z_base_dim={self.nz_base_prior}, c_dim={self.c_dim_prior}')
         
         # loss balancing
         self.scalar_loss_keys, self.field_loss_keys, lambda_dict, objective_key = get_loss_keys_and_lambdas(self.config)
@@ -248,8 +265,11 @@ class Trainer():
         
     def train(self):
         
-        # get optimizer and scheduler
-        opt = get_opt(self.config['opt'], self.config, self.model.parameters())
+        # get optimizer and scheduler (include conditional prior params when used)
+        params = list(self.model.parameters())
+        if getattr(self, 'conditional_prior', None) is not None:
+            params += list(self.conditional_prior.parameters())
+        opt = get_opt(self.config['opt'], self.config, params)
         sched = None
         if self.config.get('use_scheduler', False):
             def warm_and_decay_lr_scheduler(step: int):
@@ -257,6 +277,8 @@ class Trainer():
             sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=warm_and_decay_lr_scheduler)
         # maybe load model, optimizer and scheduler
         self.model, opt, sched = load_model_optim_sched(self.config, self.model, opt, sched)
+        if getattr(self, 'conditional_prior', None) is not None:
+            load_conditional_prior(self.config, self.conditional_prior, device=torch.get_default_device())
         
         # get z
         z = self.z_sampler.train_z()
@@ -470,14 +492,21 @@ class Trainer():
                         h_norm = (h - h_min) / max(h_max - h_min, 1e-6)
                         cols.append(torch.full((z.shape[0], 1), h_norm, device=z.device, dtype=z.dtype))
                     z = torch.cat([z] + cols, dim=1)
+            # Optionally sample z_base from conditional prior p(z_base | c)
+            if getattr(self, 'conditional_prior', None) is not None and self.config.get('sample_z_from_prior_prob', 0) > 0:
+                if random.random() < self.config['sample_z_from_prior_prob']:
+                    c = z[:, -self.c_dim_prior:]
+                    z_base_new = self.conditional_prior.sample(c)
+                    z = torch.cat([z_base_new, z[:, self.nz_base_prior:]], dim=1)
             # only plot the GINN points in the first epoch, as they are memory-intensive
             # if self.feni.constraint_to_pts_dict if epoch > 0 else combine_dicts([self.feni.constraint_to_pts_dict, self.problem.constr_pts_dict])
             vis_pts_dict = {} if epoch > 0 else self.problem.constr_pts_dict
             if self.feni is not None: 
                 vis_pts_dict = combine_dicts([vis_pts_dict, self.feni.constraint_to_pts_dict])
                 
-            ## reset base shape if needed
-            if do_plot(self.config, epoch) and is_every_n_epochs_fulfilled(epoch, self.config, 'plot_every_n_epochs'):
+            ## reset base shape if needed (skip epoch 0 if skip_plot_epoch_0 to avoid long recalc_output + PH block)
+            skip_plot_this_epoch = (epoch == 0 and self.config.get('skip_plot_epoch_0', False))
+            if not skip_plot_this_epoch and do_plot(self.config, epoch) and is_every_n_epochs_fulfilled(epoch, self.config, 'plot_every_n_epochs'):
                 z_plot = self.z_sampler.combine_z_with_z_corners(z, z_corners, n_train_shapes_to_plot)
                 if self.config['plot_shape']:
                     if self.config['nx'] == 2:
@@ -547,7 +576,10 @@ class Trainer():
                 })
             self.log_history_dict[epoch] = cur_log_dict
             self.log_to_wandb(epoch)
-            save_model_every_n_epochs(self.model, opt, sched, self.config, epoch)
+            save_model_every_n_epochs(
+                self.model, opt, sched, self.config, epoch,
+                conditional_prior=getattr(self, 'conditional_prior', None),
+            )
             pbar.set_description(f"{epoch}:" + " ".join([f"{k.replace('loss_', '')}:{v.item():.1e}" for k, v in loss_log_dict.items() if "loss_" in k and "unweighted" not in k]))
         
         ## Final logging
@@ -717,10 +749,26 @@ class Trainer():
             'obst': partial(loss_obst, netp=self.netp, p_sampler=self.problem, level_set=self.config['level_set'], nf_is_density=self.config['nf_is_density']),
             'if': partial(loss_if, netp=self.netp, p_sampler=self.problem, level_set=self.config['level_set']),
             'if_normal': partial(loss_if_normal, netp=self.netp, p_sampler=self.problem, ginn_bsize=self.config['ginn_bsize'], loss_scale=self.config.get('scale_if_normal', 1), nf_is_density=self.config['nf_is_density']),
+            'cuboid_rule': partial(loss_cuboid_rule, netp=self.netp, p_sampler=self.problem, level_set=self.config['level_set'], nf_is_density=self.config['nf_is_density']),
+            # NEW: Rule-based cuboid primitive loss with stratified sampling and boundary sharpening
+            'cuboid_primitive': partial(loss_cuboid_primitive, netp=self.netp, bounds=self.problem.bounds,
+                                        n_inside=self.config.get('cuboid_n_inside', 2000),
+                                        n_near_faces=self.config.get('cuboid_n_near_faces', 1000),
+                                        n_corners=self.config.get('cuboid_n_corners', 500),
+                                        n_far=self.config.get('cuboid_n_far', 500),
+                                        n_boundary=self.config.get('cuboid_n_boundary', 1000),
+                                        safety_margin=self.config.get('cuboid_safety_margin', 0.1),
+                                        boundary_weight=self.config.get('cuboid_boundary_weight', 0.5)),
             
             # global
             'eikonal': partial(loss_eikonal, p_sampler=self.problem, netp=self.netp, scale_eikonal=self.config.get('scale_eikonal', 1), nf_is_density=self.config['nf_is_density']),
             'scc': partial(loss_scc, ph_manager=self.ph_manager),
+            # NEW: Latent structure regularization (variance + magnitude + diversity)
+            'latent_structure': partial(loss_latent_structure, netp=self.netp, p_sampler=self.problem,
+                                        min_variance=self.config.get('latent_min_variance', 0.1),
+                                        max_magnitude=self.config.get('latent_max_magnitude', 3.0),
+                                        diversity_weight=self.config.get('latent_diversity_weight', 1.0),
+                                        n_diversity_pts=self.config.get('latent_n_diversity_pts', 100)),
             'curv': partial(loss_curv, netp=self.netp, logger=self.logger, \
                             max_curv=self.config['max_curv'], device=torch.get_default_device(), \
                             loss_scale=self.config.get('scale_curv', 1.0),
@@ -764,4 +812,11 @@ class Trainer():
             'rotsym': partial(loss_rotation_symmetric, netp=self.netp, p_sampler=self.problem, n_cycles=self.config['problem']['rotation_n_cycles']),
             
         }
+        if getattr(self, 'conditional_prior', None) is not None:
+            loss_dispatcher['prior'] = partial(
+                loss_prior,
+                conditional_prior=self.conditional_prior,
+                nz_base=self.nz_base_prior,
+                c_dim=self.c_dim_prior,
+            )
         return loss_dispatcher

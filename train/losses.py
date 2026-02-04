@@ -41,6 +41,19 @@ def interface_loss(ys, level_set):
     loss = (ys-level_set).square().mean()
     return loss
 
+
+def cuboid_rule_loss_sdf(ys_inside, ys_outside, level_set=0.0):
+    '''
+    Axis-aligned box rule: inside the box SDF should be <= level_set (negative);
+    outside the box SDF should be >= level_set (positive).
+    Penalize violations with ReLU so we do not force exact zeros.
+    '''
+    # Inside: penalize when ys_inside > level_set
+    loss_inside = torch.relu(ys_inside - level_set).mean()
+    # Outside: penalize when ys_outside < level_set
+    loss_outside = torch.relu(level_set - ys_outside).mean()
+    return loss_inside + loss_outside
+
 def normal_loss_euclidean(y_x, target_normal):
     """
     Prescribe normals at the interface via MSE.

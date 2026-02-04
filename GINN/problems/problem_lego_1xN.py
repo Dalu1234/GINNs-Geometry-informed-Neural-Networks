@@ -119,6 +119,7 @@ class ProblemLego1xN(ProblemBase):
                  nf_is_density: bool = False,
                  height_scale: float = 1.0,  # scale brick + stud height (1.0 = nominal LEGO)
                  n_studs_y: int = None,  # if set, brick is n_studs x n_studs_y (NxN when equal)
+                 no_studs: bool = True,  # if True, treat as plain cuboid (no studs) — temporary
                  **kwargs) -> None:
         super().__init__(nx=nx)
         
@@ -131,6 +132,7 @@ class ProblemLego1xN(ProblemBase):
         self.n_studs = n_studs
         self.n_studs_y = n_studs_y  # None = 1xN
         self.height_scale = float(height_scale)
+        self.no_studs = bool(no_studs)
         self.n_points_envelope = n_points_envelope
         self.n_points_interfaces = n_points_interfaces
         self.n_points_domain = n_points_domain
@@ -144,15 +146,15 @@ class ProblemLego1xN(ProblemBase):
         brick_width = (self.n_studs_y * self.STUD_SPACING - 0.2) if self.n_studs_y is not None else self.BRICK_WIDTH
         brick_height = self.BRICK_HEIGHT * self.height_scale
         stud_radius = self.STUD_DIAMETER / 2
-        total_height = brick_height + self.STUD_HEIGHT  # stud height unchanged
-        total_studs = n_studs * (self.n_studs_y if self.n_studs_y is not None else 1)
+        total_height = brick_height if self.no_studs else (brick_height + self.STUD_HEIGHT)
+        total_studs = 0 if self.no_studs else (n_studs * (self.n_studs_y if self.n_studs_y is not None else 1))
         
         # Bounding box (before normalization)
         # Center at origin, z=0 is bottom of brick
         bounds_mm = t_([
             [-brick_length/2, brick_length/2],  # x
             [-brick_width/2, brick_width/2],     # y  
-            [0, total_height]                     # z
+            [0, total_height]                     # z (cuboid only when no_studs)
         ])
         
         # Envelope is slightly inside bounds (the brick body without studs)
@@ -162,18 +164,19 @@ class ProblemLego1xN(ProblemBase):
             [0, brick_height]  # Just the body, not studs
         ])
         
-        # Stud centers: 1xN = one row along x at y=0; NxM = grid
+        # Stud centers: 1xN = one row along x at y=0; NxM = grid (empty when no_studs)
         stud_centers_mm = []
-        if self.n_studs_y is None:
-            for i in range(n_studs):
-                x = -brick_length/2 + self.STUD_SPACING/2 + i * self.STUD_SPACING
-                stud_centers_mm.append((x, 0.0))
-        else:
-            for i in range(n_studs):
-                for j in range(self.n_studs_y):
+        if not self.no_studs:
+            if self.n_studs_y is None:
+                for i in range(n_studs):
                     x = -brick_length/2 + self.STUD_SPACING/2 + i * self.STUD_SPACING
-                    y = -brick_width/2 + self.STUD_SPACING/2 + j * self.STUD_SPACING
-                    stud_centers_mm.append((x, y))
+                    stud_centers_mm.append((x, 0.0))
+            else:
+                for i in range(n_studs):
+                    for j in range(self.n_studs_y):
+                        x = -brick_length/2 + self.STUD_SPACING/2 + i * self.STUD_SPACING
+                        y = -brick_width/2 + self.STUD_SPACING/2 + j * self.STUD_SPACING
+                        stud_centers_mm.append((x, y))
         
         # Normalization
         if normalize_coords:
@@ -226,58 +229,57 @@ class ProblemLego1xN(ProblemBase):
             self.bounds, n_samples=n_points_envelope * 2
         )
         
-        # 3. AROUND INTERFACE: Buffer zone around studs (extra enforcement)
-        pts_around_interface = self._sample_around_studs(
-            stud_centers_norm, stud_radius_norm, stud_z_bottom, stud_z_top,
-            buffer_distance=stud_radius_norm * 0.5,  # 50% of stud radius
-            n_samples=n_points_envelope
-        )
+        # 3. AROUND INTERFACE: Buffer zone around studs (skip when no_studs)
+        if self.no_studs:
+            pts_around_interface = pts_outside[:n_points_envelope]  # reuse outside points
+        else:
+            pts_around_interface = self._sample_around_studs(
+                stud_centers_norm, stud_radius_norm, stud_z_bottom, stud_z_top,
+                buffer_distance=stud_radius_norm * 0.5,  # 50% of stud radius
+                n_samples=n_points_envelope
+            )
         
-        # 4. INSIDE ENVELOPE: Where material CAN exist
+        # 4. INSIDE ENVELOPE: Where material CAN exist (cuboid only when no_studs)
         pts_inside = self._sample_inside_brick(
             self.bounds, stud_centers_norm, stud_radius_norm, 
             stud_z_bottom, stud_z_top, n_samples=n_points_domain * 2
         )
         
-        # 3. INTERFACE POINTS: Full stud cylinders (tops + sides)
-        # SDF = 0 on the stud surface, with outward normals
+        # INTERFACE POINTS: Stud cylinders when not no_studs; else none (walls only below)
         interface_pts_list = []
         interface_normals_list = []
-        
-        pts_per_stud = n_points_interfaces // total_studs
-        pts_per_stud_top = pts_per_stud // 3      # 1/3 for top disk
-        pts_per_stud_side = pts_per_stud * 2 // 3  # 2/3 for cylindrical side
-        
-        for center in stud_centers_norm:  # (x, y) for each stud
-            # Stud TOP (circular disk with upward normals)
-            stud_top = CylinderTopInterface(
-                center_xy=t_(center), 
-                z_top=stud_z_top,
-                radius=stud_radius_norm,
-                n_precompute=pts_per_stud_top * 10
-            )
-            pts_top, normals_top = stud_top.get_sampled_points(pts_per_stud_top)
-            interface_pts_list.append(pts_top)
-            interface_normals_list.append(normals_top)
-            
-            # Stud SIDE (cylindrical surface with outward radial normals)
-            stud_side = CylinderSideInterface(
-                center_xy=t_(center),
-                z_bottom=stud_z_bottom,
-                z_top=stud_z_top,
-                radius=stud_radius_norm,
-                n_precompute=pts_per_stud_side * 10
-            )
-            pts_side, normals_side = stud_side.get_sampled_points(pts_per_stud_side)
-            interface_pts_list.append(pts_side)
-            interface_normals_list.append(normals_side)
-        
-        interface_pts = torch.cat(interface_pts_list, dim=0)
-        interface_normals = torch.cat(interface_normals_list, dim=0)
-        
-        # Flip normals if density field (inside = positive)
-        if nf_is_density:
-            interface_normals = -interface_normals
+        if not self.no_studs and total_studs > 0:
+            pts_per_stud = n_points_interfaces // total_studs
+            pts_per_stud_top = max(1, pts_per_stud // 3)
+            pts_per_stud_side = max(1, pts_per_stud * 2 // 3)
+            for center in stud_centers_norm:
+                stud_top = CylinderTopInterface(
+                    center_xy=t_(center), 
+                    z_top=stud_z_top,
+                    radius=stud_radius_norm,
+                    n_precompute=pts_per_stud_top * 10
+                )
+                pts_top, normals_top = stud_top.get_sampled_points(pts_per_stud_top)
+                interface_pts_list.append(pts_top)
+                interface_normals_list.append(normals_top)
+                stud_side = CylinderSideInterface(
+                    center_xy=t_(center),
+                    z_bottom=stud_z_bottom,
+                    z_top=stud_z_top,
+                    radius=stud_radius_norm,
+                    n_precompute=pts_per_stud_side * 10
+                )
+                pts_side, normals_side = stud_side.get_sampled_points(pts_per_stud_side)
+                interface_pts_list.append(pts_side)
+                interface_normals_list.append(normals_side)
+        if interface_pts_list:
+            interface_pts = torch.cat(interface_pts_list, dim=0)
+            interface_normals = torch.cat(interface_normals_list, dim=0)
+            if nf_is_density:
+                interface_normals = -interface_normals
+        else:
+            interface_pts = torch.zeros(0, 3, device=device)
+            interface_normals = torch.zeros(0, 3, device=device)
         
         # ============================================
         # Wall constraints: six faces of the brick body (SDF=0, outward normals)
@@ -291,11 +293,18 @@ class ProblemLego1xN(ProblemBase):
             end=t_([b[0, 1].item(), b[1, 1].item(), z_bottom]),
             target_normal=t_([0.0, 0.0, -1.0])
         )
-        # Top face of body (z = stud_z_bottom), normal +z — exclude stud footprints so studs are not interrupted
-        pts_top_wall, normals_top_wall = self._sample_top_wall_excluding_studs(
-            b, z_top_body, stud_centers_norm, stud_radius_norm, n_precompute=8000
-        )
-        wall_top_body = SampleConstraintWithNormals(sample_pts=pts_top_wall, normals=normals_top_wall)
+        # Top face: full rectangle when no_studs, else exclude stud footprints
+        if self.no_studs:
+            wall_top_body = RectangleInterface3D(
+                start=t_([b[0, 0].item(), b[1, 0].item(), z_top_body]),
+                end=t_([b[0, 1].item(), b[1, 1].item(), z_top_body]),
+                target_normal=t_([0.0, 0.0, 1.0])
+            )
+        else:
+            pts_top_wall, normals_top_wall = self._sample_top_wall_excluding_studs(
+                b, z_top_body, stud_centers_norm, stud_radius_norm, n_precompute=8000
+            )
+            wall_top_body = SampleConstraintWithNormals(sample_pts=pts_top_wall, normals=normals_top_wall)
         # x_min face, normal -x
         wall_x_min = RectangleInterface3D(
             start=t_([b[0, 0].item(), b[1, 0].item(), z_bottom]),
@@ -330,35 +339,34 @@ class ProblemLego1xN(ProblemBase):
         pts_outside_constraint = SampleConstraint(sample_pts=pts_outside)
         pts_around_interface_constraint = SampleConstraint(sample_pts=pts_around_interface)
         pts_inside_constraint = SampleConstraint(sample_pts=pts_inside)
-        interface_constraint = SampleConstraintWithNormals(
-            sample_pts=interface_pts, normals=interface_normals
-        )
+        if interface_pts.shape[0] > 0:
+            interface_constraint = SampleConstraintWithNormals(
+                sample_pts=interface_pts, normals=interface_normals
+            )
+        else:
+            interface_constraint = None
         
         inside_envelope = CompositeConstraint([pts_inside_constraint])
         domain = CompositeConstraint([pts_inside_constraint, pts_outside_constraint])
         
         # Number of points per wall for visualization (flat array of all wall points)
-        n_pts_wall = max(1, n_points_interfaces // (len(wall_constraints) + 1))
+        n_pts_wall = max(1, n_points_interfaces // (len(wall_constraints) + (1 if interface_constraint is not None else 0)))
         wall_pts_list = [wc.get_sampled_points(n_pts_wall)[0].cpu() for wc in wall_constraints]
         wall_pts_np = torch.cat(wall_pts_list, dim=0).numpy()
         
-        # Store for visualization (SimJEB-style keys)
+        n_env_third = max(1, n_points_envelope // 3)
         self.constr_pts_dict = {
-            # Envelope points sampled from 3 regions (like SimJEB)
-            'far_outside_envelope': pts_far_outside_constraint.get_sampled_points(N=n_points_envelope // 3).cpu().numpy(),
-            'outside_envelope': pts_outside_constraint.get_sampled_points(N=n_points_envelope // 3).cpu().numpy(),
-            'envelope_around_interface': pts_around_interface_constraint.get_sampled_points(N=n_points_envelope // 3).cpu().numpy(),
-            # Other constraints
+            'far_outside_envelope': pts_far_outside_constraint.get_sampled_points(N=n_env_third).cpu().numpy(),
+            'outside_envelope': pts_outside_constraint.get_sampled_points(N=n_env_third).cpu().numpy(),
+            'envelope_around_interface': pts_around_interface_constraint.get_sampled_points(N=n_env_third).cpu().numpy(),
             'inside_envelope': inside_envelope.get_sampled_points(N=n_points_domain).cpu().numpy(),
-            'interface': interface_constraint.get_sampled_points(N=n_points_interfaces)[0].cpu().numpy(),
+            'interface': interface_constraint.get_sampled_points(N=n_points_interfaces)[0].cpu().numpy() if interface_constraint is not None else np.zeros((0, 3)),
             'domain': domain.get_sampled_points(N=n_points_domain).cpu().numpy(),
-            # Wall faces (6 faces of brick body)
             'walls': wall_pts_np,
         }
         
-        # Store constraints for training (3 envelope regions like SimJEB)
         self._envelope_constr = [pts_outside_constraint, pts_around_interface_constraint, pts_far_outside_constraint]
-        self._interface_constraints = [interface_constraint] + wall_constraints
+        self._interface_constraints = ([interface_constraint] + wall_constraints) if interface_constraint is not None else wall_constraints
         self._obstacle_constraints = None
         self._inside_envelope = inside_envelope
         self._domain = domain
@@ -370,16 +378,15 @@ class ProblemLego1xN(ProblemBase):
         self.stud_z_top = stud_z_top
         
         label = f"{n_studs}x{self.n_studs_y}" if self.n_studs_y is not None else f"1x{n_studs}"
-        print(f"Created LEGO {label} problem (height_scale={self.height_scale:.2f}):")
+        print(f"Created LEGO {label} problem (height_scale={self.height_scale:.2f})" + (" [no_studs=cuboid only]" if self.no_studs else "") + ":")
         print(f"  Bounds: {self.bounds.tolist()}")
         print(f"  Stud centers: {len(stud_centers_norm)} studs")
         print(f"  Points: {len(pts_far_outside)} far_outside, {len(pts_outside)} outside, {len(pts_around_interface)} around_if, {len(pts_inside)} inside, {len(interface_pts)} interface, 6 walls")
     
     def sample_from_interface(self):
-        """Override: allocate more interface points to studs (tops + sides) so the interface loss
-        is not dominated by walls. Base splits n_points_interfaces equally across 7 constraints
-        (1 stud + 6 walls) -> only 1/7 on studs. Here we use 50% studs, 50% walls so studs get
-        a strong enough gradient to form."""
+        """When no_studs: equal split across 6 walls. Else: 50% studs, 50% walls."""
+        if self.no_studs:
+            return super().sample_from_interface()
         n_stud = self.n_points_interfaces // 2  # half to studs (tops + sides)
         n_wall_total = self.n_points_interfaces - n_stud
         wall_constraints = self._interface_constraints[1:]

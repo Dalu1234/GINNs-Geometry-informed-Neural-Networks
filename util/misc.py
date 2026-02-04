@@ -11,6 +11,7 @@ from models.lip_siren import CondLipSIREN
 from models.net_w_partials import NetWithPartials
 from models.siren import ConditionalSIREN, LatentModulatedSiren
 from models.wire import ConditionalWIRE
+from models.structured_lego import StructuredLegoModel
 from functools import cmp_to_key
 
 
@@ -70,7 +71,44 @@ def do_plot(config, epoch, key=None):
 def t_(x):
     return torch.tensor(x, dtype=torch.float32)
 
+
+def _safe_int(x, default=0):
+    """Convert to int; use default if value is unresolved (e.g. '${vars.nz}')."""
+    if isinstance(x, int):
+        return x
+    try:
+        return int(x)
+    except (ValueError, TypeError):
+        return default
+
+
+def resolve_problem_config(config):
+    """
+    Return (prob_cfg, problem_sampling_kwargs) with ${vars.xxx} replaced by LEGO defaults.
+    Use when config was loaded from YAML without variable resolution (e.g. notebook).
+    """
+    prob_cfg = dict(config.get('problem', {'problem_str': 'lego_1xN', 'n_studs': 4}))
+    if isinstance(prob_cfg.get('problem_str'), str) and prob_cfg['problem_str'].startswith('${'):
+        prob_cfg['problem_str'] = 'lego_1xN'
+    sampling = dict(config.get('problem_sampling', {'nx': 3}))
+    defaults = {
+        'nx': 3, 'n_points_surface': 20000, 'n_points_domain': 2048,
+        'n_points_envelope': 8192, 'n_points_interfaces': 4096, 'n_points_normals': 4096,
+    }
+    for k in list(sampling.keys()):
+        v = sampling[k]
+        if isinstance(v, str) and '${' in v:
+            sampling[k] = defaults.get(k, 3)
+        elif isinstance(v, str):
+            sampling[k] = _safe_int(v, defaults.get(k, 3))
+    return prob_cfg, sampling
+
+
 def get_problem(problem_config, **kwargs):
+    # Resolve unresolved YAML vars (e.g. ${vars.problem_str}) when config is used without resolve_problem_config
+    problem_config = dict(problem_config)
+    if isinstance(problem_config.get('problem_str'), str) and problem_config['problem_str'].startswith('${'):
+        problem_config['problem_str'] = 'lego_1xN'
     if problem_config['problem_str'] == 'obstacle':
         from GINN.problems.problem_obstacle import ProblemObstacle
         return ProblemObstacle(**problem_config, **kwargs)
@@ -165,6 +203,17 @@ def get_model(model_str, nx, nz, layers, ny=1, activation=None, w0=None, w0_init
         model = LipschitzConditionalFFN(layers=layers, nz=nz, n_ffeat=n_ffeat, sigma=ffn_sigma)
     elif model_str == 'bunny':
         model = GeneralNetBunny(act='sin')
+    elif model_str == 'structured_lego':
+        # Structured LEGO decoder: predicts geometric params, computes analytic SDF
+        model = StructuredLegoModel(
+            condition_dim=kwargs.get('condition_dim', nz),
+            z_dim=kwargs.get('structured_z_dim', 0),
+            hidden_dims=kwargs.get('structured_hidden', [64, 64]),
+            max_studs=kwargs.get('max_studs', 8),
+            predict_stud_params=kwargs.get('predict_stud_params', True),
+            smooth_k=kwargs.get('smooth_k', 0.02),
+            use_studs=kwargs.get('use_studs', True)
+        )
     else:
         raise ValueError(f'model not specified properly in config: {model}')
     return model

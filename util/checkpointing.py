@@ -56,7 +56,7 @@ def find_model_file(run_id, root_dir, use_epoch=None, get_file='model.pt', suppr
 
 
 
-def save_model_every_n_epochs(model, optim, sched, config, epoch):
+def save_model_every_n_epochs(model, optim, sched, config, epoch, conditional_prior=None):
     if not is_every_n_epochs_fulfilled(epoch, config, 'save_every_n_epochs'):
         return False, None
 
@@ -94,6 +94,12 @@ def save_model_every_n_epochs(model, optim, sched, config, epoch):
     # torch.save(model.state_dict(), model_path)
     ModelFactory.save(model, model_path)
 
+    ## save conditional prior (e.g. p(z_base|c)) in same dir so resume restores it
+    if conditional_prior is not None:
+        prior_filename = name_stem + '-prior.pt'
+        prior_path = os.path.join(model_parent_path, prior_filename)
+        torch.save(conditional_prior.state_dict(), prior_path)
+
     ## save optimizer
     if config.get('save_optimizer', False):
         optim_filename = name_stem + '-optim.pt'
@@ -119,6 +125,38 @@ def get_model_path_via_wandb_id_from_fs(run_id, root_dir, use_epoch=None, get_fi
     except Exception as e:
         print(e)
     raise ValueError(f"Could not find model with {run_id=} anywhere")
+
+
+def _get_model_load_path(config):
+    """Return the path used to load the model (for prior load)."""
+    if 'model_load_path' in config:
+        return config['model_load_path']
+    if 'model_load_wandb_id' in config:
+        return get_model_path_via_wandb_id_from_fs(config['model_load_wandb_id'], root_dir=MODELS_PARENT_DIR, suppress_print=True)
+    return None
+
+
+def load_conditional_prior(config, conditional_prior, device=None):
+    """
+    If we loaded a model from a checkpoint and conditional_prior exists,
+    load prior state from same run (name_stem + '-prior.pt'). No-op if prior is None or file missing.
+    """
+    if conditional_prior is None:
+        return conditional_prior
+    if not (config.get('load_model', False) or config.get('load_mos', False)):
+        return conditional_prior
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_load_path = _get_model_load_path(config)
+    if model_load_path is None:
+        return conditional_prior
+    prior_path = model_load_path.replace('-model.pt', '-prior.pt')
+    if not os.path.isfile(prior_path):
+        return conditional_prior
+    state = torch.load(prior_path, map_location=device)
+    conditional_prior.load_state_dict(state)
+    print(f'Loaded conditional prior from {prior_path}')
+    return conditional_prior
 
 
 def load_model_optim_sched(config, model, optim, sched, device=None):

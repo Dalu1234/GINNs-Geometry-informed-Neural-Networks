@@ -1,0 +1,44 @@
+###################
+## Structured LEGO Decoder V2
+###################
+# Tests GENERALIZATION: train on N = 2, 4, 6, 8; test on N = 3, 5, 7
+#
+# Key differences from GINN:
+# 1. Continuous N input (not one-hot) — can generalize to unseen N
+# 2. Analytic SDF from predicted parameters — no blurry interpolation
+# 3. Network learns: N → (half_L, half_H, half_D) where half_L = N * spacing / 2
+###################
+
+wandb_experiment_name: 'lego_structured_v2'
+
+# Training/Testing N split
+train_n_values: [2, 4, 6, 8]   # train on these
+test_n_values: [3, 5, 7]       # test generalization on these (held out!)
+
+# Base dimensions (normalized space)
+stud_spacing: 0.25      # spacing per stud in normalized coords
+base_half_H: 0.15       # brick height (fixed)
+base_half_D: 0.125      # brick depth (fixed, 1 stud wide)
+base_stud_radius: 0.10  # stud radius
+base_stud_height: 0.08  # stud height
+
+# Model
+model:
+  z_dim: 4                    # latent for variation (stud radius/height tweaks)
+  hidden_dims: [64, 64]       # parameter head MLP
+  max_studs: 12               # max studs supported
+  smooth_k: 0.02              # CSG blending radius
+  use_studs: false            # box only for now (set true to add studs)
+
+# Training
+batch_size: 32
+train:
+  epochs: 300
+  lr: 1e-3
+
+# Loss weights
+lambda_box: 10.0   # supervise (half_L, half_H, half_D)
+lambda_sdf: 1.0    # supervise SDF values directly
+
+# Checkpoint
+checkpoint_path: 'checkpoints/structured_lego_v2'

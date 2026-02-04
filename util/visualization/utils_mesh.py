@@ -14,19 +14,42 @@ from shapely.geometry import MultiPolygon
 from util.model_utils import tensor_product_xz
 
 def mc(V, level=0, return_normals=False):
-    '''Marching cubes'''
+    '''Marching cubes. If level is not in the volume range, prints diagnostics and retries with level=None (uses (min+max)/2).'''
     V = V.detach().cpu().numpy()
+    v_min, v_max = float(np.min(V)), float(np.max(V))
     try:
         verts, faces, normals, values = measure.marching_cubes(V, level)
-    except:
-        print("WARNING: level not within the volume data range. Returning empty mesh.")
-        verts, faces, normals = np.zeros([0,3], dtype=float), np.zeros([0,3], dtype=int), np.zeros([0,3], dtype=float)
+    except Exception:
+        # level not in [v_min, v_max] -> no isosurface at level; try mid-range so we get some mesh for diagnostics
+        print(f"WARNING: level={level} not in volume range [{v_min:.4g}, {v_max:.4g}]. Trying level=None (mid-range).")
+        try:
+            verts, faces, normals, values = measure.marching_cubes(V, level=None)
+        except Exception:
+            print("WARNING: marching_cubes failed with level=None. Returning empty mesh.")
+            verts, faces, normals = np.zeros([0,3], dtype=float), np.zeros([0,3], dtype=int), np.zeros([0,3], dtype=float)
     if return_normals: return verts, faces, -normals
     return verts, faces
 
 def preprocess_for_watertight(vals):
-    """Pad a 3D array with zeros plus some extra TODO"""
-    vals_ = vals * -1 # not 100% sure why this is needed here
+    """
+    Preprocess SDF values for watertight mesh extraction via marching cubes.
+    
+    SIGN FLIP EXPLANATION:
+    - scikit-image's marching_cubes finds isosurface where f = level
+    - Points where f < level are "inside" the mesh
+    - For SDF: values are already negative inside, positive outside
+    - The sign flip here (vals * -1) inverts this so:
+      - After flip: positive = inside, negative = outside
+    - This is later compensated by flipping face winding (faces[:,::-1])
+      in get_watertight_mesh_for_latent()
+    
+    IMPORTANT: This double-flip approach produces correct meshes but is fragile.
+    If only one of the flips is applied, meshes will be inside-out.
+    
+    Padding with zeros ensures the SDF is positive (outside) at grid boundaries,
+    which closes the mesh properly for watertight extraction.
+    """
+    vals_ = vals * -1  # Sign flip - compensated by face flip later
     vals_ = torch.nn.functional.pad(vals_, (1,1,1,1,1,1))
     return vals_
 
