@@ -127,8 +127,31 @@ def get_model_path_via_wandb_id_from_fs(run_id, root_dir, use_epoch=None, get_fi
     raise ValueError(f"Could not find model with {run_id=} anywhere")
 
 
+def _get_latest_model_path(search_dir):
+    """Glob *-model.pt under search_dir, sort by mtime, return path to latest."""
+    pattern = os.path.join(search_dir, '**', '*-model.pt')
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return None
+    latest = max(candidates, key=os.path.getmtime)
+    return latest
+
+
 def _get_model_load_path(config):
     """Return the path used to load the model (for prior load)."""
+    if config.get('model_load_latest', False):
+        search_dir = config.get('model_load_latest_dir')
+        if not search_dir and 'model_save_path' in config and 'model' in config:
+            model_str = config['model'].get('model_str', '')
+            if model_str:
+                search_dir = os.path.join(config['model_save_path'], model_str)
+        if not search_dir:
+            raise ValueError('model_load_latest is True but model_load_latest_dir is not set and cannot derive from model_save_path/model_str')
+        path = _get_latest_model_path(search_dir)
+        if path is None:
+            raise ValueError(f'model_load_latest is True but no *-model.pt found under {search_dir}')
+        print(f'Loading latest checkpoint: {path}')
+        return path
     if 'model_load_path' in config:
         return config['model_load_path']
     if 'model_load_wandb_id' in config:
@@ -165,34 +188,58 @@ def load_model_optim_sched(config, model, optim, sched, device=None):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     ## Load model weights
     if not (config.get('load_model', False) or config.get('load_mos', False)):
-        if 'model_load_path' in config or 'model_load_wandb_id' in config:
-            print('WARNING: model_load_path or model_load_wandb_id specified but load_model is False. Ignoring.')
+        if config.get('model_load_latest') or 'model_load_path' in config or 'model_load_wandb_id' in config:
+            print('WARNING: model load option set but load_model/load_mos is False. Ignoring.')
         return model, optim, sched
 
-    if 'model_load_wandb_id' in config:
-        assert 'model_load_path' not in config, 'model_load_path and model_load_wandb_id cannot be specified at the same time'
-        model_load_path = get_model_path_via_wandb_id_from_fs(config['model_load_wandb_id'], root_dir=MODELS_PARENT_DIR)
-        print(f'Loading model from {model_load_path}...')
-        model.load_state_dict(torch.load(model_load_path, map_location=device)['state_dict'])
+    if config.get('model_load_latest') and 'model_load_path' in config:
+        raise ValueError('model_load_latest and model_load_path cannot be specified at the same time')
+    if config.get('model_load_latest') and 'model_load_wandb_id' in config:
+        raise ValueError('model_load_latest and model_load_wandb_id cannot be specified at the same time')
+    if 'model_load_path' in config and 'model_load_wandb_id' in config:
+        raise ValueError('model_load_path and model_load_wandb_id cannot be specified at the same time')
+    if not (config.get('model_load_latest') or 'model_load_path' in config or 'model_load_wandb_id' in config):
+        raise ValueError('One of model_load_latest, model_load_path or model_load_wandb_id must be specified if load_model/load_mos is True')
 
-        ## Load optimizer and scheduler
-        if config.get('load_optimizer', False) or config.get('load_mos', False):
-            optim_load_path = model_load_path.replace('-model.pt', '-optim.pt')
-            print(f'Loading optimizer from {optim_load_path}...')
-            optim.load_state_dict(torch.load(optim_load_path, map_location=device))
+    model_load_path = _get_model_load_path(config)
+    if model_load_path is None:
+        raise ValueError('Could not resolve model load path')
 
-        if config.get('use_scheduler', False) or config.get('load_mos', False):
-            sched_load_path = model_load_path.replace('-model.pt', '-sched.pt')
-            print(f'Loading scheduler from {sched_load_path}...')
-            sched.load_state_dict(torch.load(sched_load_path, map_location=device))
+    print(f'Loading model from {model_load_path}...')
+    ckpt = torch.load(model_load_path, map_location=device)
+    state = ckpt['state_dict'] if isinstance(ckpt, dict) and 'state_dict' in ckpt else ckpt
+    model.load_state_dict(state)
 
-    elif 'model_load_path' in config:
-        assert config.get('load_optimizer', False) == False, 'load_optimizer is not supported with model_load_path'
-        ## Load model from path
-        model.load_state_dict(torch.load(config['model_load_path'], map_location=device))
-    else:
-        raise ValueError('model_load_path or model_load_wandb_id must be specified if load_model is True')
+    if config.get('load_optimizer', False) or config.get('load_mos', False):
+        optim_load_path = model_load_path.replace('-model.pt', '-optim.pt')
+        if os.path.isfile(optim_load_path):
+            try:
+                print(f'Loading optimizer from {optim_load_path}...')
+                optim.load_state_dict(torch.load(optim_load_path, map_location=device))
+            except (ValueError, RuntimeError) as e:
+                if 'parameter group' in str(e).lower() or 'size' in str(e).lower():
+                    print(f'WARNING: Could not load optimizer (param groups do not match): {e}')
+                    print('         Continuing with fresh optimizer; model weights were loaded.')
+                else:
+                    raise
+        else:
+            print(f'No optimizer checkpoint at {optim_load_path}, skipping.')
 
+    if config.get('use_scheduler', False) or config.get('load_mos', False):
+        sched_load_path = model_load_path.replace('-model.pt', '-sched.pt')
+        if os.path.isfile(sched_load_path):
+            try:
+                print(f'Loading scheduler from {sched_load_path}...')
+                sched.load_state_dict(torch.load(sched_load_path, map_location=device))
+            except (ValueError, RuntimeError) as e:
+                print(f'WARNING: Could not load scheduler: {e}. Continuing with fresh scheduler.')
+        else:
+            print(f'No scheduler checkpoint at {sched_load_path}, skipping.')
+
+    ## Optionally save back into the same run directory (true "resume current run")
+    if config.get('resume_same_run_dir', False):
+        config['save_model_dir'] = os.path.dirname(model_load_path)
+        print(f'Resuming same run: saves will go to {config["save_model_dir"]}')
 
     return model, optim, sched
 

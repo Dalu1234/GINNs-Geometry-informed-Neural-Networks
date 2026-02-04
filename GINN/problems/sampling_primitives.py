@@ -114,6 +114,49 @@ def sample_axis_parallel_rectangle_in_3d(start_xyz, end_xyz, N=50):
 
 
 # =============================================================================
+# CYLINDER PRIMITIVE SAMPLING (axis-aligned along z; for stud-grid loss)
+# =============================================================================
+
+def sample_inside_cylinder(center_xy, radius, z_bottom, z_top, n, device=None):
+    """
+    Sample n points uniformly inside a vertical cylinder (axis along z).
+    
+    Args:
+        center_xy: (2,) or (x, y) center in the xy-plane
+        radius: scalar radius
+        z_bottom, z_top: scalar z extent
+        n: number of points
+        device: optional torch device
+    
+    Returns:
+        (n, 3) tensor of points inside the cylinder
+    """
+    if device is None:
+        device = center_xy.device if hasattr(center_xy, 'device') else torch.device('cpu')
+    center_xy = torch.as_tensor(center_xy, device=device, dtype=torch.float32)
+    if center_xy.dim() == 0:
+        center_xy = center_xy.unsqueeze(0).expand(2)
+    radius = float(radius) if hasattr(radius, 'item') else float(radius)
+    z_bottom = float(z_bottom) if hasattr(z_bottom, 'item') else float(z_bottom)
+    z_top = float(z_top) if hasattr(z_top, 'item') else float(z_top)
+    # Oversample in bbox then reject outside disk
+    n_try = max(n * 4, 500)
+    xy = center_xy + (2 * radius) * (torch.rand(n_try, 2, device=device) - 0.5)
+    z_pts = z_bottom + (z_top - z_bottom) * torch.rand(n_try, 1, device=device)
+    pts = torch.cat([xy, z_pts], dim=1)
+    dist_xy = torch.norm(pts[:, :2] - center_xy.unsqueeze(0), dim=1)
+    inside = dist_xy < radius
+    pts = pts[inside]
+    if pts.shape[0] >= n:
+        return pts[:n]
+    # If not enough after reject, sample again to fill
+    while pts.shape[0] < n:
+        extra = sample_inside_cylinder(center_xy, radius, z_bottom, z_top, n - pts.shape[0], device)
+        pts = torch.cat([pts, extra], dim=0)
+    return pts[:n]
+
+
+# =============================================================================
 # BOX PRIMITIVE SAMPLING (for rule-based cuboid loss)
 # =============================================================================
 

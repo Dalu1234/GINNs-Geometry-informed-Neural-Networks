@@ -759,6 +759,11 @@ class Trainer():
                                         n_boundary=self.config.get('cuboid_n_boundary', 1000),
                                         safety_margin=self.config.get('cuboid_safety_margin', 0.1),
                                         boundary_weight=self.config.get('cuboid_boundary_weight', 0.5)),
+            # Stud grid: cylinder at every (i,j) → compositional rule for generalization to any N
+            'stud_grid': partial(loss_stud_grid, netp=self.netp, problem=self.problem,
+                                        n_samples_per_stud=self.config.get('stud_grid_n_samples', 200),
+                                        safety_margin=self.config.get('stud_grid_safety_margin', 0.05),
+                                        stud_spacing=self.config.get('stud_spacing_normalized', 1.0)),
             
             # global
             'eikonal': partial(loss_eikonal, p_sampler=self.problem, netp=self.netp, scale_eikonal=self.config.get('scale_eikonal', 1), nf_is_density=self.config['nf_is_density']),

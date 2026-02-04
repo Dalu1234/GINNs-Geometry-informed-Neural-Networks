@@ -177,6 +177,88 @@ def loss_cuboid_primitive(z, netp, bounds, n_inside=2000, n_near_faces=1000,
     return total_loss
 
 
+# =============================================================================
+# CYLINDER PRIMITIVE LOSS (for studs: SDF < 0 inside each cylinder)
+# Used by loss_stud_grid to teach "cylinder at every grid position" → generalizes to any N
+# =============================================================================
+def cylinder_primitive_loss(z, netp, center_xy, radius, z_bottom, z_top, n_samples=200, safety_margin=0.05, **kwargs) -> Scalar:
+    """
+    Penalize SDF > -safety_margin inside a vertical cylinder (axis along z).
+    Teaches: "inside this cylinder → SDF negative."
+    
+    Args:
+        z: (B, nz) latent codes
+        netp: network with grouped_fwd
+        center_xy: (2,) or (x, y) in same coordinate system as model (e.g. LEGO normalized)
+        radius, z_bottom, z_top: cylinder geometry
+        n_samples: points to sample inside cylinder
+        safety_margin: inside cylinder we want f < -safety_margin
+    """
+    from GINN.problems.sampling_primitives import sample_inside_cylinder
+    device = z.device
+    dtype = z.dtype
+    center_xy = torch.as_tensor(center_xy, device=device, dtype=dtype)
+    if center_xy.dim() == 1 and center_xy.shape[0] == 2:
+        pass
+    else:
+        center_xy = center_xy.reshape(2)
+    x_inside = sample_inside_cylinder(center_xy, radius, z_bottom, z_top, n_samples, device=device)
+    x_in_tp, z_in_tp = tensor_product_xz(x_inside, z)
+    f_inside = netp.grouped_fwd('vf', x_in_tp, z_in_tp).squeeze(-1)
+    loss = torch.relu(f_inside + safety_margin).mean()
+    return loss
+
+
+def loss_stud_grid(z, netp, problem, n_samples_per_stud=200, safety_margin=0.05, stud_spacing=1.0, **kwargs) -> Scalar:
+    """
+    Place a cylinder loss at EVERY stud grid position (i, j) for i < N_studs, j < N_studs_y.
+    This is the compositional rule: "cylinder at (x_tile=0.5, y_tile=0.5)" so with tiled
+    coords the network learns the periodic pattern and generalizes to unseen N (e.g. 1x5).
+    
+    Uses the same centered coordinate system as the LEGO problem (normalized space).
+    When problem has no stud_centers (no_studs=True), we compute grid from n_studs, n_studs_y.
+    """
+    if not getattr(problem, 'n_studs', None) or not getattr(problem, 'stud_radius', None):
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    from GINN.problems.sampling_primitives import sample_inside_cylinder
+    device = z.device
+    dtype = z.dtype
+    N_studs = problem.n_studs
+    N_studs_y = getattr(problem, 'n_studs_y', None) or 1
+    stud_radius = problem.stud_radius
+    if hasattr(stud_radius, 'item'):
+        stud_radius = stud_radius.item()
+    stud_z_bottom = problem.stud_z_bottom
+    stud_z_top = problem.stud_z_top
+    if hasattr(stud_z_bottom, 'item'):
+        stud_z_bottom = stud_z_bottom.item()
+    if hasattr(stud_z_top, 'item'):
+        stud_z_top = stud_z_top.item()
+    # Centered grid: same convention as problem_lego_1xN (stud_spacing=1 in normalized space)
+    # x_i = i - (N_studs-1)/2, y_j = j - (N_studs_y-1)/2
+    loss_total = torch.tensor(0.0, device=device, dtype=dtype)
+    n_studs = 0
+    for i in range(N_studs):
+        for j in range(N_studs_y):
+            cx = (i - (N_studs - 1) / 2.0) * stud_spacing
+            cy = (j - (N_studs_y - 1) / 2.0) * stud_spacing
+            center_xy = (cx, cy)
+            loss_stud = cylinder_primitive_loss(
+                z, netp,
+                center_xy=center_xy,
+                radius=stud_radius,
+                z_bottom=stud_z_bottom,
+                z_top=stud_z_top,
+                n_samples=n_samples_per_stud,
+                safety_margin=safety_margin,
+            )
+            loss_total = loss_total + loss_stud
+            n_studs += 1
+    if n_studs == 0:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+    return loss_total / n_studs
+
+
 # Keep old loss_cuboid_rule for backward compatibility (deprecated)
 def loss_cuboid_rule(z, netp, p_sampler, level_set, nf_is_density, **kwargs) -> Scalar:
     """
