@@ -108,8 +108,8 @@ lambda_env: 0   # was 0 - replaced by cuboid_primitive
 lambda_obst: ${eval:${vars.ginn_on} * 0.0}
 lambda_if_normal: 0   # was 0 - cuboid_primitive + eikonal provide correct normals
 lambda_cuboid_rule: 0   # was 0 - DEPRECATED: use cuboid_primitive instead
-lambda_cuboid_primitive: ${eval:${vars.ginn_on} * 10}   # KEEP: good cuboid; rule-based box
-lambda_stud_grid: ${eval:${vars.ginn_on} * 5}   # KEEP: cylinder at every stud (i,j) → improve studs
+lambda_cuboid_primitive: ${eval:${vars.ginn_on} * 0}   # KEEP: good cuboid; rule-based box
+lambda_stud_grid: ${eval:${vars.ginn_on} * 10}   # KEEP: cylinder at every stud (i,j) → improve studs
 lambda_prior: ${eval:${vars.ginn_on} * 0}       # was 0.01 - conditional latent prior
 lambda_latent_structure: ${eval:${vars.ginn_on} * 0}   # was 0.1 - latent space health
 sample_z_from_prior_prob: 0.0   # probability of sampling z_base from prior(c) instead of buffer/sampler (0 = off)
@@ -261,7 +261,7 @@ timer:
 problem:
   problem_str: ${vars.problem_str}
   n_studs: 2  # LEGO-specific: default when not conditioning (1x2); ignored when condition_on_n_studs is true (N sampled per batch)
-  no_studs: true   # temporary: cuboid only (no studs); set false to restore studs
+  no_studs: false  # train on studs: interface points on stud tops/sides + stud_grid loss
 
 problem_sampling:
   ## Number of points to sample (conservative for 8GB GPU to avoid crashes)
@@ -294,14 +294,15 @@ grad_clipping:
 # model_save_path: '_saved_models'
 model_save_path: 'path/to/dir'
 save_every_n_epochs: 10
-overwrite_existing_saved_model: false  # keep all checkpoints (e.g. ...-it_00010-model.pt)
+overwrite_existing_saved_model: true   # only one checkpoint in this run's folder (last save before success/cancel)
 save_optimizer: true
 
-## Weight loading (resume from latest checkpoint under model_save_path/cond_wire)
+## Weight loading (resume from specific checkpoint)
 load_mos: true   # load model, optimizer, scheduler
 load_model: true
 load_optimizer: true
 load_scheduler: true
-model_load_latest: true  # use latest *-model.pt by mtime (optional: model_load_latest_dir)
-resume_same_run_dir: true  # save into the same run we loaded from (true "current run" resume)
-# model_load_wandb_id: 'mb8z12t1'  # or set explicit path: model_load_path: 'path/to/run/model.pt'
+model_load_latest: false
+model_load_path: 'path/to/dir/cond_wire/2026_02_03__22_28_55-89jdkw55/2026_02_03__22_28_55-89jdkw55-model.pt'
+resume_same_run_dir: false  # save to a NEW folder (not the one we loaded from)
+# model_load_wandb_id: 'mb8z12t1'
