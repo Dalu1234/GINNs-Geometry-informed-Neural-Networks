@@ -75,7 +75,7 @@ lambda_prior: 0
 lambda_rotsym: 0
 lambda_scc: 35
 lambda_shape_diversity: 0
-lambda_stud_grid: 5
+lambda_stud_grid: 0
 lambda_vol: 0
 latent_diversity_weight: 1.0
 latent_max_magnitude: 3.0
@@ -140,6 +140,9 @@ model:
   n_studs_values:
   - 2
   - 4
+  - 5
+  - 8
+  - 12
   nx: 3
   ny: 1
   nz: 2
@@ -152,13 +155,15 @@ model:
   w0: 1.0
   w0_initial: 18
   wire_scale: 6
-model_load_latest: false
 model_load_path: path/to/dir/cond_wire/2026_02_03__22_28_55-89jdkw55/2026_02_03__22_28_55-89jdkw55-model.pt
 model_save_path: path/to/dir
 n_points_data: -1
 n_studs_values:
 - 2
 - 4
+- 5
+- 8
+- 12
 n_studs_y_values:
 - 1
 nf_is_density: false
@@ -210,7 +215,7 @@ prior_hidden:
 prior_min_sigma: 0.001
 problem:
   n_studs: 2
-  no_studs: false
+  no_studs: true
   problem_str: lego_1xN
   rotation_n_cycles: 0
   simjeb_root_dir: GINN/simJEB/data
@@ -225,7 +230,7 @@ reset_zlatents_every_n_epochs: 1
 resume_same_run_dir: false
 sample_z_from_prior_prob: 0.0
 save_every_n_epochs: 10
-save_model_dir: path/to/dir\cond_wire\2026_02_04__18_22_47-7xsu5o6q
+save_model_dir: path/to/dir\cond_wire\2026_02_04__19_19_25-pyps8bgh
 save_optimizer: true
 scale_chamfer_div: 1
 scale_comp: 1
@@ -291,7 +296,7 @@ violation_buffer:
   use: true
 wandb_entity_name: daludk-star-labs
 wandb_experiment_name: lego_1xN_cond_wire
-wandb_id: 7xsu5o6q
+wandb_id: pyps8bgh
 wandb_project_name: topginn
 weight_rescale_alpha: 0.9
 weight_rescale_interval: 100
