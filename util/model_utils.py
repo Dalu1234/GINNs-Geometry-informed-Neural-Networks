@@ -39,32 +39,51 @@ def tile_coords_xy(x, period_x=1.0, period_y=1.0, center=True):
         return np.concatenate([x, x_tile[..., None], y_tile[..., None]], axis=-1)
 
 
-def dist_to_edge_x_from_z(x, z, n_studs_values, n_norm_col=2):
+def dist_to_edge_x_from_z(x, z, n_studs_values, n_norm_col=2, n_norm_col_end=None):
     """
     Signed distance to nearest x-boundary of the brick (positive inside, negative outside).
     Decodes brick type from z and uses normalized LEGO formula: half_length_x = (n_studs - 0.025) / 2.
 
     x: [B, 3] or [3] (x, y, z in normalized space; 1D when called under vmap).
-    z: [B, nz] or [nz]; n_norm_col is the column index for n conditioning (0–1 normalized).
+    z: [B, nz] or [nz]. N conditioning: either single column n_norm in [0,1], or Gaussian weights in z[:, n_norm_col:n_norm_col_end].
     n_studs_values: list of N values (e.g. [2, 3, 4, 6]).
+    n_norm_col_end: if set and > n_norm_col+1, z[:, n_norm_col:n_norm_col_end] is weight vector over n_studs_values; n_eff = sum(weights * support).
 
     Returns:
         dist_to_edge_x: [B] or scalar signed distance (positive inside brick).
     """
-    n_min = min(n_studs_values)
-    n_max = max(n_studs_values)
+    support = torch.tensor(n_studs_values, device=z.device, dtype=z.dtype)
+    nz = z.shape[-1]
+    use_smooth = (
+        n_norm_col_end is not None
+        and (n_norm_col_end - n_norm_col) >= len(n_studs_values)
+        and nz >= n_norm_col_end
+    )
     if z.dim() == 1:
-        n_norm = z[n_norm_col].clamp(0.0, 1.0)
-        half_length_x = (n_min + n_norm * (n_max - n_min) - 0.025) / 2.0
+        if use_smooth:
+            w = z[n_norm_col:n_norm_col_end]
+            n_eff = (w * support).sum()
+        else:
+            n_min = min(n_studs_values)
+            n_max = max(n_studs_values)
+            n_norm = z[n_norm_col].clamp(0.0, 1.0)
+            n_eff = n_min + n_norm * (n_max - n_min)
+        half_length_x = (n_eff - 0.025) / 2.0
         x_coord = x[0]
         dist_to_edge_x = torch.minimum(
             x_coord + half_length_x,
             half_length_x - x_coord
         )
     else:
-        n_norm = z[:, n_norm_col].clamp(0.0, 1.0)
-        n_studs = n_min + n_norm * (n_max - n_min)
-        half_length_x = (n_studs - 0.025) / 2.0
+        if use_smooth:
+            w = z[:, n_norm_col:n_norm_col_end]  # (B, len(support))
+            n_eff = (w * support.unsqueeze(0)).sum(dim=1)  # (B,)
+        else:
+            n_min = min(n_studs_values)
+            n_max = max(n_studs_values)
+            n_norm = z[:, n_norm_col].clamp(0.0, 1.0)
+            n_eff = n_min + n_norm * (n_max - n_min)
+        half_length_x = (n_eff - 0.025) / 2.0
         dist_to_edge_x = torch.minimum(
             x[:, 0] + half_length_x,
             half_length_x - x[:, 0]

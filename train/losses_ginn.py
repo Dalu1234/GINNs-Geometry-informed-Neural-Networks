@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from GINN.fenitop.heaviside_filter import heaviside
 from models.net_w_partials import NetWithPartials
 from models.point_wrapper import PointWrapper
-from util.model_utils import tensor_product_xz
+from util.model_utils import tensor_product_xz, dist_to_edge_x_from_z
 from train.losses import CD_dCDdy_loss, chamfer_diversity_loss, cuboid_rule_loss_sdf, diversity_loss, dirichlet_loss, envelope_loss_density, expression_curvature_loss, interface_loss, eikonal_loss, envelope_loss_sdf, l1_loss, mse_loss, normal_loss_euclidean, wasserstein_diversity_loss
 
 Scalar: typing.TypeAlias = torch.Tensor #TODO: need to implement this more rigorously using torchtypeing https://github.com/patrick-kidger/torchtyping
@@ -84,6 +84,37 @@ def loss_if(z, netp, p_sampler, level_set, **kwargs) -> Scalar:
 
 
 # =============================================================================
+# UNSEEN-N VIOLATION LOSS (GENERALIZATION)
+# Purpose: Penalize poor constraint satisfaction on unseen N (e.g. 3, 6, 7) so the
+#          model generalizes beyond training n_studs_values.
+# How: For each unseen N, build z with conditioning for that N, compute interface +
+#      envelope loss (same as violation metric), mean over unseen N and z samples.
+# Note: Differentiable w.r.t. model parameters; use lambda_unseen_violation to enable.
+# =============================================================================
+def loss_unseen_violation(z, netp, unseen_problems, _build_z_for_n, n_z_samples, level_set, nf_is_density, **kwargs) -> Scalar:
+    """
+    Mean interface + envelope loss over unseen N (and over n_z_samples per N).
+    If unseen_problems is empty, returns 0.0. Uses _build_z_for_n(N, n_samples, device) to get z.
+    """
+    if not unseen_problems:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    device = z.device
+    total = torch.tensor(0.0, device=device, dtype=z.dtype)
+    count = 0
+    for N, problem in unseen_problems.items():
+        z_n = _build_z_for_n(N, n_z_samples, device)
+        for i in range(z_n.shape[0]):
+            z_single = z_n[i : i + 1]
+            l_if = loss_if(z=z_single, netp=netp, p_sampler=problem, level_set=level_set)
+            l_env = loss_env(z=z_single, netp=netp, p_sampler=problem, level_set=level_set, nf_is_density=nf_is_density)
+            total = total + l_if + l_env
+            count += 1
+    if count == 0:
+        return torch.tensor(0.0, device=device, dtype=z.dtype)
+    return total / count
+
+
+# =============================================================================
 # CUBOID PRIMITIVE LOSS (RULE-BASED)
 # Purpose: Teach the network what a box IS, not memorize specific surfaces
 # How: 
@@ -94,15 +125,18 @@ def loss_if(z, netp, p_sampler, level_set, **kwargs) -> Scalar:
 #   5. Boundary sharpening → f ≈ true_distance near faces
 # Note: This IS rule-encoding — learns "box = negative inside, positive outside"
 # =============================================================================
-def loss_cuboid_primitive(z, netp, bounds=None, n_inside=2000, n_near_faces=1000,
+def loss_cuboid_primitive(z, netp, bounds=None, bounds_body=None, n_inside=2000, n_near_faces=1000,
                           n_corners=500, n_far=500, n_boundary=1000,
                           safety_margin=0.1, boundary_weight=0.5, **kwargs) -> Scalar:
     """
     Teach: A cuboid is a region where f < 0 inside a box, f > 0 outside.
     Uses stratified sampling and boundary sharpening for better learning.
     Bounds can be passed at call time (e.g. for conditional LEGO per-batch problem).
+    For LEGO: pass bounds_body (body-only, z max = stud_z_bottom) so the cuboid
+    does not sample inside the stud volume; stud_grid handles the studs.
     """
-    bounds = bounds if bounds is not None else kwargs.get('bounds')
+    # Prefer body-only bounds when given (LEGO) so cuboid does not intersect stud
+    bounds = bounds_body if bounds_body is not None else (bounds if bounds is not None else kwargs.get('bounds'))
     if bounds is None:
         return torch.tensor(0.0, device=z.device, dtype=z.dtype)
     from GINN.problems.sampling_primitives import (
@@ -293,6 +327,73 @@ def loss_stud_grid(z, netp, problem=None, n_samples_per_stud=200, safety_margin=
         )
         loss_total = loss_total + loss_stud
     return loss_total / len(centers_list)
+
+
+def loss_phantom_stud(z, netp, problem=None, margin=0.1, n_phantom_per_side=2, phantom_offsets=None, **kwargs) -> Scalar:
+    """
+    Rule-enforcement (phantom-stud) loss: penalize negative SDF at positions that have
+    the same tiled-coord pattern as studs but are outside the brick (e.g. just past the
+    last stud). Encourages using dist_to_edge and the "stud only if inside" rule.
+    Phantom points: same stud height, x just outside half_length (centered coords).
+    """
+    problem = problem if problem is not None else kwargs.get('problem')
+    if problem is None:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    bounds = getattr(problem, 'bounds', None)
+    if bounds is None or bounds.dim() < 2:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    device = z.device
+    dtype = z.dtype
+    stud_z_bottom = getattr(problem, 'stud_z_bottom', None)
+    stud_z_top = getattr(problem, 'stud_z_top', None)
+    if stud_z_bottom is None or stud_z_top is None:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+    stud_z_bottom = float(stud_z_bottom.item() if hasattr(stud_z_bottom, 'item') else stud_z_bottom)
+    stud_z_top = float(stud_z_top.item() if hasattr(stud_z_top, 'item') else stud_z_top)
+    stud_z_mid = (stud_z_bottom + stud_z_top) * 0.5
+    half_x = float(bounds[0, 1].item() if hasattr(bounds[0, 1], 'item') else bounds[0, 1])
+    if phantom_offsets is not None:
+        offsets = list(phantom_offsets)
+    else:
+        offsets = [0.5 + i * 1.0 for i in range(n_phantom_per_side)]
+    # Phantom points: x = half_x + off, x = -half_x - off, y = 0, z = stud_z_mid (centered coords)
+    y_mid = 0.0
+    if bounds.shape[0] >= 2:
+        y_mid = float((bounds[1, 0] + bounds[1, 1]).item() * 0.5) if hasattr(bounds[1, 0], 'item') else (bounds[1, 0] + bounds[1, 1]) * 0.5
+    pts_list = []
+    for off in offsets:
+        pts_list.append([half_x + off, y_mid, stud_z_mid])
+        pts_list.append([-half_x - off, y_mid, stud_z_mid])
+    x_phantom = torch.tensor(pts_list, device=device, dtype=dtype)
+    x_tp, z_tp = tensor_product_xz(x_phantom, z)
+    sdf = netp.grouped_fwd('vf', x_tp, z_tp).squeeze(-1)
+    loss = torch.relu(-sdf - margin).mean()
+    return loss
+
+
+def loss_outside_brick_sdf(z, netp, p_sampler, n_studs_values, n_norm_col=2, n_norm_col_end=None,
+                           margin=0.1, n_samples=500, **kwargs) -> Scalar:
+    """
+    Stronger "outside brick" signal: at points where dist_to_edge < -margin, penalize f < 0
+    (push SDF above a small positive value). Reinforces "outside brick → positive SDF" and
+    reduces phantom studs. Reuses existing dist_to_edge_x_from_z.
+    """
+    if not n_studs_values or len(n_studs_values) == 0:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    sampler = kwargs.get('problem', p_sampler)
+    xs = sampler.sample_from_envelope()
+    if xs.shape[0] > n_samples:
+        perm = torch.randperm(xs.shape[0], device=xs.device)[:n_samples]
+        xs = xs[perm]
+    x_tp, z_tp = tensor_product_xz(xs, z)
+    dist = dist_to_edge_x_from_z(x_tp, z_tp, n_studs_values, n_norm_col, n_norm_col_end)
+    sdf = netp.grouped_fwd('vf', x_tp, z_tp).squeeze(-1)
+    outside = dist < -margin
+    if outside.sum() == 0:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    # Push SDF above margin where clearly outside brick
+    loss = torch.relu(margin - sdf[outside]).mean()
+    return loss
 
 
 # Keep old loss_cuboid_rule for backward compatibility (deprecated)

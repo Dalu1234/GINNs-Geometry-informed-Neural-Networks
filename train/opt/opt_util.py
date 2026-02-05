@@ -65,7 +65,17 @@ def opt_step(opt, epoch, model, loss_and_backward_fn, z, z_corners, batch, auto_
 def get_opt(opt_name, opt_params, model_params):
     if opt_name == 'adam':
         param_list = [{'params': model_params}]
-        return Adam(param_list) #, **opt_params)  ## use default parameters
+        lr = opt_params.get('lr', 1e-3)
+        weight_decay = opt_params.get('weight_decay', 0.0)
+        adam_kw = {
+            'lr': float(lr),
+            'weight_decay': float(weight_decay),
+        }
+        if 'betas' in opt_params:
+            adam_kw['betas'] = opt_params['betas']
+        if 'eps' in opt_params:
+            adam_kw['eps'] = opt_params['eps']
+        return Adam(param_list, **adam_kw)
     elif opt_name == 'lbfgs':
         if "history_size" in opt_params:
             opt_params["history_size"] = int(opt_params["history_size"])

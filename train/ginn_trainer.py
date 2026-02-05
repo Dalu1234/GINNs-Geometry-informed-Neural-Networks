@@ -28,7 +28,7 @@ from GINN.speed.timer import Timer
 from train.train_utils.latent_sampler import LatentSampler
 from train.train_utils.violation_buffer import ViolationBuffer
 from util.checkpointing import load_model_optim_sched, load_conditional_prior, save_model_every_n_epochs
-from util.misc import combine_dicts, do_plot, get_model, get_problem, is_every_n_epochs_fulfilled
+from util.misc import combine_dicts, do_plot, encode_n_gaussian, get_model, get_problem, is_every_n_epochs_fulfilled
 from train.losses_ginn import *
 from train.losses_diversity import diversity_loss_chamfer, diversity_loss_contrastive, diversity_loss_volume_symmetric_difference, diversity_loss_combined
 from train.losses_connectivity_v2 import CachedConnectivityLossV2 as CachedConnectivityLoss
@@ -57,7 +57,6 @@ class Trainer():
         model_kw = dict(config['model'])
         model_kw['layers'] = list(model_kw.get('layers', [128, 128, 128]))  # copy; get_model mutates
         if self.condition_on_n_studs:
-
             # Prefer top-level; LEGO config may keep it under vars after merge
             self.n_studs_values = list(
                 config.get('n_studs_values')
@@ -65,7 +64,13 @@ class Trainer():
                 or [2, 3]
             )
             self.logger.info(f'n_studs_values (brick types): {self.n_studs_values}')
-            model_kw['nz'] = model_kw['nz'] + 1  # shape latent + 1 for N
+            self.use_smooth_n_encoding = config.get('use_smooth_n_encoding', False)
+            self.smooth_n_sigma = config.get('smooth_n_sigma', 1.0)
+            if self.use_smooth_n_encoding:
+                model_kw['nz'] = model_kw['nz'] + len(self.n_studs_values)  # one dim per support N
+                model_kw['use_smooth_n_encoding'] = True
+            else:
+                model_kw['nz'] = model_kw['nz'] + 1  # shape latent + 1 for N
         if self.condition_on_n_studs_y:
             self.n_studs_y_values = list(config.get('n_studs_y_values', [1, 2, 4]))  # 1 = 1xN, 2+ = NxM
             model_kw['nz'] = model_kw['nz'] + 1  # +1 for N_y
@@ -108,7 +113,17 @@ class Trainer():
             n0, ny0, h0 = self._n_list[0], self._ny_list[0], self._h_list[0]
             key0 = (n0, ny0, h0) if self.condition_on_height and self.condition_on_n_studs_y else (n0, ny0) if self.condition_on_n_studs_y else (n0, h0) if self.condition_on_height else n0
             self.problem = self.problems[key0]
+            # Unseen-N evaluation: problems for N not in training set
+            unseen_list = [n for n in list(self.config.get('unseen_n_studs', [])) if n not in self._n_list]
+            self.unseen_problems = {}
+            for n in unseen_list:
+                prob_cfg = {**self.config['problem'], 'n_studs': n, 'height_scale': self._h_list[0]}
+                prob_cfg['n_studs_y'] = None if self._ny_list[0] == 1 else self._ny_list[0]
+                self.unseen_problems[n] = get_problem(problem_config=prob_cfg, **self.config['problem_sampling'])
+            if self.unseen_problems:
+                self.logger.info(f'Unseen-N eval: {list(self.unseen_problems.keys())} every {self.config.get("unseen_eval_every_n_epochs", 200)} epochs')
         else:
+            self.unseen_problems = {}
             self.problem = get_problem(problem_config=self.config['problem'], **self.config['problem_sampling'])
 
         self.timer = Timer(**self.config['timer'], lock=mp_manager.get_lock())
@@ -212,7 +227,8 @@ class Trainer():
         if self.config.get('lambda_prior', 0) > 0 and (self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height):
             from train.train_utils.conditional_prior import ConditionalPrior
             self.nz_base_prior = self.config['latent_sampling']['nz']
-            self.c_dim_prior = (1 if self.condition_on_n_studs else 0) + (1 if self.condition_on_n_studs_y else 0) + (1 if self.condition_on_height else 0)
+            n_dim = (len(self.n_studs_values) if (self.condition_on_n_studs and getattr(self, 'use_smooth_n_encoding', False)) else (1 if self.condition_on_n_studs else 0))
+            self.c_dim_prior = n_dim + (1 if self.condition_on_n_studs_y else 0) + (1 if self.condition_on_height else 0)
             prior_hidden = self.config.get('prior_hidden', [32, 32])
             self.conditional_prior = ConditionalPrior(
                 c_dim=self.c_dim_prior,
@@ -255,13 +271,54 @@ class Trainer():
             return c_key[0], 1, 1.0
         return c_key, 1, 1.0
 
-    def _compute_violation_for_z_c(self, z_single, c_key):
-        """Interface + envelope loss (no_grad) for one (z, c) pair."""
-        problem = self.problems[c_key]
+    def _compute_violation_for_z_c(self, z_single, c_key=None, problem=None):
+        """Interface + envelope loss (no_grad) for one (z, c) pair. Use problem= for unseen N."""
+        if problem is None:
+            problem = self.problems[c_key]
         with torch.no_grad():
             l_if = loss_if(z=z_single, netp=self.netp, p_sampler=problem, level_set=self.config['level_set'])
             l_env = loss_env(z=z_single, netp=self.netp, p_sampler=problem, level_set=self.config['level_set'], nf_is_density=self.config['nf_is_density'])
         return (l_if + l_env).item()
+
+    def _build_z_for_n(self, N, n_samples, device):
+        """Build z (n_samples, nz) with conditioning for given N (1xN, ny=1, h=1)."""
+        z_interval = self.config.get('latent_sampling', {}).get('z_sample_interval', [0, 0.1])
+        low, high = float(z_interval[0]), float(z_interval[1])
+        z_base = torch.rand(n_samples, self.config['latent_sampling']['nz'], device=device, dtype=torch.float32) * (high - low) + low
+        cols = []
+        if self.condition_on_n_studs:
+            if getattr(self, 'use_smooth_n_encoding', False):
+                w = encode_n_gaussian(N, self.n_studs_values, sigma=self.smooth_n_sigma, device=device, dtype=z_base.dtype)
+                cols.append(w.unsqueeze(0).expand(n_samples, -1))
+            else:
+                n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                n_norm = (N - n_min) / max(n_max - n_min, 1)
+                cols.append(torch.full((n_samples, 1), n_norm, device=device, dtype=z_base.dtype))
+        if self.condition_on_n_studs_y:
+            cols.append(torch.zeros(n_samples, 1, device=device, dtype=z_base.dtype))
+        if self.condition_on_height:
+            cols.append(torch.zeros(n_samples, 1, device=device, dtype=z_base.dtype))
+        if cols:
+            z_base = torch.cat([z_base] + cols, dim=1)
+        return z_base
+
+    def _eval_unseen_n(self, epoch):
+        """Compute mean violation (or other metric) over unseen N, log to cur_log_dict."""
+        if not getattr(self, 'unseen_problems', None) or not self.unseen_problems:
+            return {}
+        metric = self.config.get('unseen_eval_metric', 'violation')
+        n_z = self.config.get('unseen_eval_n_z_samples', 4)
+        device = next(self.model.parameters()).device
+        results = {}
+        for n in self.unseen_problems:
+            problem = self.unseen_problems[n]
+            z_n = self._build_z_for_n(n, n_z, device)
+            if metric == 'violation':
+                vals = [self._compute_violation_for_z_c(z_n[i:i + 1], problem=problem) for i in range(n_z)]
+                results[f'unseen_violation_N{n}'] = sum(vals) / len(vals)
+        if results:
+            results['unseen_violation_mean'] = sum(results[k] for k in results if k.startswith('unseen_violation_N')) / len([k for k in results if k.startswith('unseen_violation_N')])
+        return results
         
     def train(self):
         
@@ -292,12 +349,20 @@ class Trainer():
         if self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height:
             cols = []
             if self.condition_on_n_studs:
-                n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
-                n_col = torch.tensor(
-                    [(self.n_studs_values[i % len(self.n_studs_values)] - n_min) / max(n_max - n_min, 1) for i in range(z_val.shape[0])],
-                    device=z_val.device, dtype=z_val.dtype
-                ).unsqueeze(1)
-                cols.append(n_col)
+                if getattr(self, 'use_smooth_n_encoding', False):
+                    n_weights_list = [
+                        encode_n_gaussian(self.n_studs_values[i % len(self.n_studs_values)], self.n_studs_values, sigma=self.smooth_n_sigma, device=z_val.device, dtype=z_val.dtype)
+                        for i in range(z_val.shape[0])
+                    ]
+                    n_col = torch.stack(n_weights_list, dim=0)  # (batch, len(n_studs_values))
+                    cols.append(n_col)
+                else:
+                    n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                    n_col = torch.tensor(
+                        [(self.n_studs_values[i % len(self.n_studs_values)] - n_min) / max(n_max - n_min, 1) for i in range(z_val.shape[0])],
+                        device=z_val.device, dtype=z_val.dtype
+                    ).unsqueeze(1)
+                    cols.append(n_col)
             if self.condition_on_n_studs_y:
                 ny_min, ny_max = min(self.n_studs_y_values), max(self.n_studs_y_values)
                 ny_col = torch.tensor(
@@ -436,9 +501,14 @@ class Trainer():
                 self._sync_problem_dependents()
                 cols = []
                 if self.condition_on_n_studs:
-                    n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
-                    n_norm = (N - n_min) / max(n_max - n_min, 1)
-                    cols.append(torch.full((z_bases.shape[0], 1), n_norm, device=z_bases.device, dtype=z_bases.dtype))
+                    if getattr(self, 'use_smooth_n_encoding', False):
+                        w = encode_n_gaussian(N, self.n_studs_values, sigma=self.smooth_n_sigma, device=z_bases.device, dtype=z_bases.dtype)
+                        n_col = w.unsqueeze(0).expand(z_bases.shape[0], -1)
+                        cols.append(n_col)
+                    else:
+                        n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                        n_norm = (N - n_min) / max(n_max - n_min, 1)
+                        cols.append(torch.full((z_bases.shape[0], 1), n_norm, device=z_bases.device, dtype=z_bases.dtype))
                 if self.condition_on_n_studs_y:
                     ny_min, ny_max = min(self.n_studs_y_values), max(self.n_studs_y_values)
                     ny_norm = (ny - ny_min) / max(ny_max - ny_min, 1)
@@ -480,9 +550,14 @@ class Trainer():
                     self._sync_problem_dependents()
                     cols = []
                     if self.condition_on_n_studs:
-                        n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
-                        n_norm = (N - n_min) / max(n_max - n_min, 1)
-                        cols.append(torch.full((z.shape[0], 1), n_norm, device=z.device, dtype=z.dtype))
+                        if getattr(self, 'use_smooth_n_encoding', False):
+                            w = encode_n_gaussian(N, self.n_studs_values, sigma=self.smooth_n_sigma, device=z.device, dtype=z.dtype)  # (len(n_studs_values),)
+                            n_col = w.unsqueeze(0).expand(z.shape[0], -1)  # (batch, len(n_studs_values))
+                            cols.append(n_col)
+                        else:
+                            n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                            n_norm = (N - n_min) / max(n_max - n_min, 1)
+                            cols.append(torch.full((z.shape[0], 1), n_norm, device=z.device, dtype=z.dtype))
                     if self.condition_on_n_studs_y:
                         ny_min, ny_max = min(self.n_studs_y_values), max(self.n_studs_y_values)
                         ny_norm = (ny - ny_min) / max(ny_max - ny_min, 1)
@@ -566,6 +641,10 @@ class Trainer():
             if not getattr(self, '_last_step_skipped', False):
                 self.loss_calculator.adaptive_update()  # is a no-op for ManualWeightedLoss
 
+            ## Unseen-N evaluation (every K epochs)
+            if epoch > 0 and is_every_n_epochs_fulfilled(epoch, self.config, 'unseen_eval_every_n_epochs'):
+                unseen_metrics = self._eval_unseen_n(epoch)
+                cur_log_dict.update(unseen_metrics)
             ## Async Logging
             cur_log_dict.update({
                 'neg_loss_div': (-1) * loss_log_dict['loss_div'] if 'loss_div' in loss_log_dict else 0.0,
@@ -677,6 +756,7 @@ class Trainer():
         step_kw = dict(z=z, z_corners=z_corners, p=self.p, epoch=epoch, batch=batch,
                       p_surface=self.p_surface, weights_surf_pts=self.weights_surf_pts, x_fem=x_fem,
                       problem=self.problem, bounds=getattr(self.problem, 'bounds', None),
+                      bounds_body=getattr(self.problem, 'bounds_body', None),
                       n_outside_per_stud=self.config.get('stud_grid_n_outside', 50),
                       stud_shell_thickness=self.config.get('stud_grid_shell_thickness', 0.05))
         for key in self.scalar_loss_keys:
@@ -768,6 +848,24 @@ class Trainer():
                                         n_samples_per_stud=self.config.get('stud_grid_n_samples', 200),
                                         safety_margin=self.config.get('stud_grid_safety_margin', 0.05),
                                         stud_spacing=self.config.get('stud_spacing_normalized', 1.0)),
+            # Phantom-stud (rule-enforcement): penalize negative SDF just outside brick at stud height
+            'phantom_stud': partial(loss_phantom_stud, netp=self.netp,
+                                        margin=self.config.get('phantom_stud_margin', 0.1),
+                                        n_phantom_per_side=self.config.get('phantom_stud_n_per_side', 2)),
+            # Outside-brick SDF: at points with dist_to_edge < -margin, push f > margin (positive SDF)
+            'outside_brick_sdf': partial(loss_outside_brick_sdf, netp=self.netp, p_sampler=self.problem,
+                                        n_studs_values=getattr(self, 'n_studs_values', self.config.get('n_studs_values', [2, 3])),
+                                        n_norm_col=2,
+                                        n_norm_col_end=(2 + len(getattr(self, 'n_studs_values', []))) if getattr(self, 'use_smooth_n_encoding', False) else None,
+                                        margin=self.config.get('outside_brick_sdf_margin', 0.1),
+                                        n_samples=self.config.get('outside_brick_sdf_n_samples', 500)),
+            # Unseen-N violation: penalize interface+envelope on unseen N (e.g. 3, 6, 7) for generalization
+            'unseen_violation': partial(loss_unseen_violation, netp=self.netp,
+                                        unseen_problems=getattr(self, 'unseen_problems', {}),
+                                        _build_z_for_n=self._build_z_for_n,
+                                        n_z_samples=self.config.get('unseen_eval_n_z_samples', 4),
+                                        level_set=self.config['level_set'],
+                                        nf_is_density=self.config['nf_is_density']),
             
             # global
             'eikonal': partial(loss_eikonal, p_sampler=self.problem, netp=self.netp, scale_eikonal=self.config.get('scale_eikonal', 1), nf_is_density=self.config['nf_is_density']),

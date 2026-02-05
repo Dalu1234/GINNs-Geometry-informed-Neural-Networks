@@ -197,8 +197,9 @@ training_mode: 'single'
 seed: 11
 ## Outer optimization loop
 lr: 0.001
-## optimizer
+## optimizer (weight_decay = L2 regularization)
 opt: adam  # adam, lbfgs, adam_lbfgs, adam_nncg, adam_lbfgs_nncg
+weight_decay: 0.0   # e.g. 1e-5, 1e-4 to reduce overfitting
 ## scheduler
 use_scheduler: False
 scheduler_gamma: 0.5

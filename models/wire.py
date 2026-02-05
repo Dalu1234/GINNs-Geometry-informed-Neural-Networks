@@ -200,15 +200,18 @@ class ConditionalWIRE(nn.Module):
                  use_dist_to_edge=False,
                  n_studs_values=None,
                  n_norm_col=2,
+                 use_smooth_n_encoding=False,
                  use_hypernet=False,
                  lora_rank=4,
                  c_dim=3,
                  hypernet_hidden=(32, 32),
                  lora_init_scale=0.01,
+                 dropout_p=0.0,
                  **kwargs):
         super().__init__()
         self.layers = layers
         self.return_density = return_density
+        self.dropout_p = float(dropout_p) if dropout_p else 0.0
         self.first_omega_0 = first_omega_0
         self.hidden_omega_0 = hidden_omega_0
         self.scale = scale
@@ -219,6 +222,8 @@ class ConditionalWIRE(nn.Module):
         self.use_dist_to_edge = use_dist_to_edge and (n_studs_values is not None and len(n_studs_values) > 0)
         self.n_studs_values = list(n_studs_values) if n_studs_values is not None else []
         self.n_norm_col = n_norm_col
+        self.use_smooth_n_encoding = use_smooth_n_encoding and len(self.n_studs_values) > 0
+        self.n_norm_col_end = (n_norm_col + len(self.n_studs_values)) if self.use_smooth_n_encoding else None
         self.use_hypernet = use_hypernet
         self.c_dim = c_dim
 
@@ -237,12 +242,16 @@ class ConditionalWIRE(nn.Module):
                                     sigma0=scale,
                                     is_first=True,
                                     trainable=False))
+        if self.dropout_p > 0:
+            self.net.append(nn.Dropout(self.dropout_p))
 
         for i in range(1, len(layers) - 2):
             self.net.append(self.nonlin(layers[i],
                                         layers[i+1], 
                                         omega0=hidden_omega_0,
                                         sigma0=scale))
+            if self.dropout_p > 0:
+                self.net.append(nn.Dropout(self.dropout_p))
 
         final_linear = nn.Linear(layers[-2],
                                  layers[-1])
@@ -300,7 +309,7 @@ class ConditionalWIRE(nn.Module):
             z = z.unsqueeze(0)
         if self.use_dist_to_edge:
             from util.model_utils import dist_to_edge_x_from_z
-            dist_x = dist_to_edge_x_from_z(x, z, self.n_studs_values, self.n_norm_col)
+            dist_x = dist_to_edge_x_from_z(x, z, self.n_studs_values, self.n_norm_col, n_norm_col_end=self.n_norm_col_end)
             x = torch.cat([x, dist_x.unsqueeze(-1)], dim=-1)
         if self.use_tiled_coords:
             from util.model_utils import tile_coords_xy

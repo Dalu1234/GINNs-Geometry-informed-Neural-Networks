@@ -6,14 +6,17 @@ wandb_experiment_name: 'lego_1xN_cond_wire'
 # put all reused variables into vars
 vars:
   nx: 3 # input is 3D
-  nz: 2 # dimension of the modulation vector (shape latent; +1 when condition_on_n_studs)
+  nz: 6 # dimension of the modulation vector (shape latent; +1 when condition_on_n_studs)
   ginn_bsize: 4 # batch size; 4 for 8GB GPU stability (was 6)
   val_plot_grid: [3, 3] # [n_first_dims, shapes_per_dim]; sampled using equidistant z (if nz>2), otherwise see latent_sampler
   problem_str: 'lego_1xN'
   ginn_on: 1
   # Conditioning on N (number of studs): one model for 1x2, 1x3, 1x4, 1x6 etc.
   condition_on_n_studs: true
-  n_studs_values: [2,4,5,8,12]  # N studs: 2 → 1x2 only
+  n_studs_values: [1,2,4,5]  # N studs: 2 → 1x2 only
+  # Smooth N encoding: Gaussian blend over n_studs_values so unseen N (e.g. 7) is blend of 6,8
+  use_smooth_n_encoding: false    # false = single scalar n_norm; true = vector of Gaussian weights
+  smooth_n_sigma: 1.0            # sigma for Gaussian blend (only when use_smooth_n_encoding)
   # Conditioning on NxN (second dimension): 1 = 1xN, 2+ = NxM grid
   condition_on_n_studs_y: true
   n_studs_y_values: [1]   # 1 = 1xN only → no 2x2, 4x4
@@ -23,6 +26,11 @@ vars:
   n_points_surface: 20000  # reduced from 40001 to avoid CUDA OOM when curvature starts (get_surface_pts)
   nf_is_density: false
   level_set: 0.0
+  # Unseen-N evaluation: every K epochs compute metric on fixed unseen N (e.g. 3, 6, 7) for generalization monitoring
+  unseen_n_studs: [3, 6, 7]   # N not in n_studs_values; set [] to disable
+  unseen_eval_every_n_epochs: 50
+  unseen_eval_metric: 'violation'   # 'violation' = mean interface+envelope loss; 'chamfer' = mean Chamfer to rule mesh (if implemented)
+  unseen_eval_n_z_samples: 2       # z samples per unseen N for violation mean
 
 
 # useful global variables
@@ -33,10 +41,16 @@ level_set: ${vars.level_set}
 nf_is_density: ${vars.nf_is_density}
 condition_on_n_studs: ${vars.condition_on_n_studs}
 n_studs_values: ${vars.n_studs_values}
+use_smooth_n_encoding: ${vars.use_smooth_n_encoding}
+smooth_n_sigma: ${vars.smooth_n_sigma}
 condition_on_n_studs_y: ${vars.condition_on_n_studs_y}
 n_studs_y_values: ${vars.n_studs_y_values}
 condition_on_height: ${vars.condition_on_height}
 height_values: ${vars.height_values}
+unseen_n_studs: ${vars.unseen_n_studs}
+unseen_eval_every_n_epochs: ${vars.unseen_eval_every_n_epochs}
+unseen_eval_metric: ${vars.unseen_eval_metric}
+unseen_eval_n_z_samples: ${vars.unseen_eval_n_z_samples}
 
 
 model:
@@ -59,6 +73,8 @@ model:
   c_dim: 3
   hypernet_hidden: [64, 64, 32]   # deeper/wider so U,V have more capacity to differ across brick types
   lora_init_scale: 0.01
+  # Regularization: dropout after hidden layers to reduce overfitting
+  dropout_p: 0.05
 
 reset_zlatents_every_n_epochs: 1  # uncomment to set; not set means the latents are kept fix
 latent_sampling:
@@ -108,8 +124,11 @@ lambda_if_normal: 0
 lambda_cuboid_rule: 0
 lambda_cuboid_primitive: ${eval:${vars.ginn_on} * 2}   # base box so field has coherent shape
 lambda_stud_grid: ${eval:${vars.ginn_on} * 3}         # cylinders on top for studs
+lambda_phantom_stud: ${eval:${vars.ginn_on} * 0.5}    # rule-enforcement: penalize negative SDF just outside brick at stud height
+lambda_outside_brick_sdf: ${eval:${vars.ginn_on} * 0.3}   # outside brick (dist_to_edge < -margin) → push SDF > margin
 lambda_prior: ${eval:${vars.ginn_on} * 0.01}   # small: train prior so sample_z_from_prior_prob can sample z ~ p(z|c)
 lambda_latent_structure: ${eval:${vars.ginn_on} * 0.01}   # prevent collapse, cap magnitude, encourage diversity
+lambda_unseen_violation: 0.5   # penalize poor constraint satisfaction on unseen N (e.g. 3, 6, 7); set > 0 to enable
 sample_z_from_prior_prob: 0.3   # 30% of batches: sample z_base from prior (only when lambda_prior > 0)
 prior_hidden: [32, 32]
 prior_min_sigma: 1.0e-3
@@ -130,6 +149,10 @@ stud_grid_n_outside: 40      # fewer outside samples to reduce inward pull
 stud_grid_shell_thickness: 0.02   # thinner shell: [radius, radius+this] in normalized space
 stud_grid_safety_margin: 0.05
 stud_spacing_normalized: 1.0 # in normalized LEGO space; 1 unit = one stud spacing
+
+# Outside-brick SDF loss (dist_to_edge < -margin → push f > margin)
+outside_brick_sdf_margin: 0.1
+outside_brick_sdf_n_samples: 500
 
 # Latent structure loss settings (latent space regularization)
 latent_min_variance: 0.1      # minimum z variance per dim (prevent collapse)
@@ -278,8 +301,9 @@ problem_sampling:
 ## Outer optimization loop
 max_epochs: 5000
 lr: 0.001
-## optimizer
+## optimizer (weight_decay = L2 regularization to reduce overfitting)
 opt: adam  # adam, lbfgs, adam_lbfgs, adam_nncg, adam_lbfgs_nncg
+weight_decay: 1e-5   # L2 regularization to reduce overfitting
 ## scheduler
 use_scheduler: false
 scheduler_gamma: 0.5

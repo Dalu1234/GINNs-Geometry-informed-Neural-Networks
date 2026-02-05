@@ -4,6 +4,21 @@ import random
 import numpy as np
 import torch
 
+
+def encode_n_gaussian(N, support_points, sigma=1.0, device=None, dtype=None):
+    """
+    Encode scalar N as a vector of Gaussian weights over support points (e.g. n_studs_values).
+    Unseen N (e.g. 7) gets a blend of nearby training N (6, 8). Weights sum to 1.
+    Returns: tensor of shape (len(support_points),); same device/dtype as support if tensor, else optional device/dtype.
+    """
+    support = torch.as_tensor(support_points, device=device, dtype=dtype or torch.get_default_dtype())
+    n_val = N if isinstance(N, (int, float)) else (N.item() if hasattr(N, 'item') else float(N))
+    n_val = torch.tensor(n_val, device=support.device, dtype=support.dtype)
+    d = (n_val - support) / max(float(sigma), 1e-8)
+    w = torch.exp(-(d ** 2))
+    w = w / (w.sum() + 1e-10)
+    return w
+
 from models.NN import ConditionalGeneralNet, ConditionalGeneralResNet, GeneralNet, GeneralNetBunny, GeneralNetPosEnc, GeneralResNet
 from models.lip_ffn import LipschitzConditionalFFN
 from models.lip_mlp import CondLipMLP

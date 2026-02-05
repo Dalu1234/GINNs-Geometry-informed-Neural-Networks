@@ -377,11 +377,26 @@ class ProblemLego1xN(ProblemBase):
         self.stud_z_bottom = stud_z_bottom
         self.stud_z_top = stud_z_top
         
+        # Body-only bounds (z max = stud_z_bottom) for cuboid_primitive so it does not sample inside stud volume
+        self._bounds_body = self.bounds.clone()
+        if not self.no_studs:
+            sb = stud_z_bottom
+            if hasattr(sb, 'to'):
+                sb = sb.to(self.bounds.device, self.bounds.dtype)
+            else:
+                sb = torch.tensor(sb, device=self.bounds.device, dtype=self.bounds.dtype)
+            self._bounds_body[2, 1] = sb
+        
         label = f"{n_studs}x{self.n_studs_y}" if self.n_studs_y is not None else f"1x{n_studs}"
         print(f"Created LEGO {label} problem (height_scale={self.height_scale:.2f})" + (" [no_studs=cuboid only]" if self.no_studs else "") + ":")
         print(f"  Bounds: {self.bounds.tolist()}")
         print(f"  Stud centers: {len(stud_centers_norm)} studs")
         print(f"  Points: {len(pts_far_outside)} far_outside, {len(pts_outside)} outside, {len(pts_around_interface)} around_if, {len(pts_inside)} inside, {len(interface_pts)} interface, 6 walls")
+    
+    @property
+    def bounds_body(self):
+        """Bounds of the brick body only (z max = stud_z_bottom). Use for cuboid_primitive so it does not sample inside stud volume."""
+        return self._bounds_body
     
     def sample_from_interface(self):
         """When no_studs: equal split across 6 walls. Else: 50% studs, 50% walls."""

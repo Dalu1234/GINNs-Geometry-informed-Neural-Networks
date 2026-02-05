@@ -38,25 +38,25 @@ class NetWithPartials:
                 return functional_call(model, params, x)
             ## Jacobian
             f_x = jacrev(f, argnums=1)  ## params, [nx] -> [nx, ny]
-            vf_x = vmap(f_x, in_dims=(None, 0), out_dims=(0))  ## params, [bx, nx] -> [bx, ny, nx]
+            vf_x = vmap(f_x, in_dims=(None, 0), out_dims=(0), randomness='different')
             ## Hessian
             f_xx = jacfwd(f_x, argnums=1)  ## params, [nx] -> [nx, ny, nx]
-            vf_xx = vmap(f_xx, in_dims=(None, 0), out_dims=(0))  ## params, [bx, nx] -> [bx, ny, nx, nx]
+            vf_xx = vmap(f_xx, in_dims=(None, 0), out_dims=(0), randomness='different')
             vf_z = None
         else:
             def f(params, x, z):
                 return functional_call(model, params, (x, z))
-            vf = vmap(f, in_dims=(None, 0, 0), out_dims=(0))  ## params, [bxz, nx], [bxz, nz] -> [bxz, ny]
+            vf = vmap(f, in_dims=(None, 0, 0), out_dims=(0), randomness='different')  ## params, [bxz, nx], [bxz, nz] -> [bxz, ny]; allow dropout
             ## Note the difference: in the in_dims and out_dims we want to vectorize in the 0-th dimension
             ## Jacobian
             f_x = jacrev(f, argnums=1)  ## params, [nx], [nz] -> [nx, ny]
-            vf_x = vmap(f_x, in_dims=(None, 0, 0), out_dims=(0))  ## params, [bxz, nx], [bxz, nz] -> [bxz, ny, nx]
+            vf_x = vmap(f_x, in_dims=(None, 0, 0), out_dims=(0), randomness='different')
             ## Hessian
             f_xx = jacfwd(f_x, argnums=1)  ## params, [nx], [nz] -> [nx, ny, nx]
-            vf_xx = vmap(f_xx, in_dims=(None, 0, 0), out_dims=(0))  ## params, [bxz, nx], [bxz, nz] -> [bxz, ny, nx, nx]
+            vf_xx = vmap(f_xx, in_dims=(None, 0, 0), out_dims=(0), randomness='different')
             ## Jacobian wrt z
             f_z = jacrev(f, argnums=2)  ## params, [nx], [nz] -> [nz, ny]
-            vf_z = vmap(f_z, in_dims=(None, 0, 0), out_dims=(0))  ## params, [bxz, nx], [bxz, nz] -> [bxz, ny, nz]
+            vf_z = vmap(f_z, in_dims=(None, 0, 0), out_dims=(0), randomness='different')
             
             return NetWithPartials(f=f, vf=vf, vf_x=vf_x, vf_xx=vf_xx, 
                                params=params, nz=nz, nx=nx, vf_z=vf_z, 
