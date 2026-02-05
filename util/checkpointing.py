@@ -65,7 +65,8 @@ def save_model_every_n_epochs(model, optim, sched, config, epoch, conditional_pr
     ## create directory, save config only if it does not exist
     if 'save_model_dir' not in config:
         name_stem = datetime.datetime.now().strftime("%Y_%m_%d__%H_%M_%S") + '-' + config['wandb_id']
-        model_parent_path = os.path.join(config['model_save_path'], config['model']['model_str'], name_stem)
+        save_subdir = config.get('model_save_subdir', config['model']['model_str'])
+        model_parent_path = os.path.join(config['model_save_path'], save_subdir, name_stem) if save_subdir else os.path.join(config['model_save_path'], name_stem)
         config['save_model_dir'] = model_parent_path
 
         ## create parent directory if it does not exist
@@ -142,9 +143,9 @@ def _get_model_load_path(config):
     if config.get('model_load_latest', False):
         search_dir = config.get('model_load_latest_dir')
         if not search_dir and 'model_save_path' in config and 'model' in config:
-            model_str = config['model'].get('model_str', '')
-            if model_str:
-                search_dir = os.path.join(config['model_save_path'], model_str)
+            save_subdir = config.get('model_save_subdir', config['model'].get('model_str', ''))
+            if save_subdir:
+                search_dir = os.path.join(config['model_save_path'], save_subdir)
         if not search_dir:
             raise ValueError('model_load_latest is True but model_load_latest_dir is not set and cannot derive from model_save_path/model_str')
         path = _get_latest_model_path(search_dir)

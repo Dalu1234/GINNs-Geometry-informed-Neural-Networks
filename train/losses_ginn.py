@@ -94,25 +94,17 @@ def loss_if(z, netp, p_sampler, level_set, **kwargs) -> Scalar:
 #   5. Boundary sharpening → f ≈ true_distance near faces
 # Note: This IS rule-encoding — learns "box = negative inside, positive outside"
 # =============================================================================
-def loss_cuboid_primitive(z, netp, bounds, n_inside=2000, n_near_faces=1000, 
+def loss_cuboid_primitive(z, netp, bounds=None, n_inside=2000, n_near_faces=1000,
                           n_corners=500, n_far=500, n_boundary=1000,
                           safety_margin=0.1, boundary_weight=0.5, **kwargs) -> Scalar:
     """
     Teach: A cuboid is a region where f < 0 inside a box, f > 0 outside.
     Uses stratified sampling and boundary sharpening for better learning.
-    
-    Args:
-        z: latent codes (B, nz)
-        netp: network with partials
-        bounds: (3, 2) tensor [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
-        n_inside: points inside box
-        n_near_faces: points just outside each face
-        n_corners: points near box corners
-        n_far: points far from box
-        n_boundary: points on/near faces for SDF supervision
-        safety_margin: how far inside/outside to enforce
-        boundary_weight: weight for boundary sharpening term
+    Bounds can be passed at call time (e.g. for conditional LEGO per-batch problem).
     """
+    bounds = bounds if bounds is not None else kwargs.get('bounds')
+    if bounds is None:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
     from GINN.problems.sampling_primitives import (
         sample_inside_box, sample_near_box_faces, sample_near_box_corners,
         sample_far_from_box, sample_on_box_faces_with_sdf
@@ -181,20 +173,13 @@ def loss_cuboid_primitive(z, netp, bounds, n_inside=2000, n_near_faces=1000,
 # CYLINDER PRIMITIVE LOSS (for studs: SDF < 0 inside each cylinder)
 # Used by loss_stud_grid to teach "cylinder at every grid position" → generalizes to any N
 # =============================================================================
-def cylinder_primitive_loss(z, netp, center_xy, radius, z_bottom, z_top, n_samples=200, safety_margin=0.05, **kwargs) -> Scalar:
+def cylinder_primitive_loss(z, netp, center_xy, radius, z_bottom, z_top, n_samples=200, safety_margin=0.05,
+                           n_outside=0, shell_thickness=0.05, **kwargs) -> Scalar:
     """
-    Penalize SDF > -safety_margin inside a vertical cylinder (axis along z).
-    Teaches: "inside this cylinder → SDF negative."
-    
-    Args:
-        z: (B, nz) latent codes
-        netp: network with grouped_fwd
-        center_xy: (2,) or (x, y) in same coordinate system as model (e.g. LEGO normalized)
-        radius, z_bottom, z_top: cylinder geometry
-        n_samples: points to sample inside cylinder
-        safety_margin: inside cylinder we want f < -safety_margin
+    Penalize SDF > -safety_margin inside the cylinder; optionally penalize SDF < safety_margin
+    in a thin shell outside so the zero-level set sits at the cylinder boundary.
     """
-    from GINN.problems.sampling_primitives import sample_inside_cylinder
+    from GINN.problems.sampling_primitives import sample_inside_cylinder, sample_outside_cylinder_shell
     device = z.device
     dtype = z.dtype
     center_xy = torch.as_tensor(center_xy, device=device, dtype=dtype)
@@ -206,25 +191,29 @@ def cylinder_primitive_loss(z, netp, center_xy, radius, z_bottom, z_top, n_sampl
     x_in_tp, z_in_tp = tensor_product_xz(x_inside, z)
     f_inside = netp.grouped_fwd('vf', x_in_tp, z_in_tp).squeeze(-1)
     loss = torch.relu(f_inside + safety_margin).mean()
+    if n_outside > 0 and shell_thickness > 0:
+        ro = float(radius) + float(shell_thickness)
+        x_outside = sample_outside_cylinder_shell(
+            center_xy, radius, ro, z_bottom, z_top, n_outside, device=device
+        )
+        x_out_tp, z_out_tp = tensor_product_xz(x_outside, z)
+        f_outside = netp.grouped_fwd('vf', x_out_tp, z_out_tp).squeeze(-1)
+        loss = loss + torch.relu(safety_margin - f_outside).mean()
     return loss
 
 
-def loss_stud_grid(z, netp, problem, n_samples_per_stud=200, safety_margin=0.05, stud_spacing=1.0, **kwargs) -> Scalar:
+def loss_stud_grid(z, netp, problem=None, n_samples_per_stud=200, safety_margin=0.05, stud_spacing=1.0, **kwargs) -> Scalar:
     """
-    Place a cylinder loss at EVERY stud grid position (i, j) for i < N_studs, j < N_studs_y.
-    This is the compositional rule: "cylinder at (x_tile=0.5, y_tile=0.5)" so with tiled
-    coords the network learns the periodic pattern and generalizes to unseen N (e.g. 1x5).
-    
-    Uses the same centered coordinate system as the LEGO problem (normalized space).
-    When problem has no stud_centers (no_studs=True), we compute grid from n_studs, n_studs_y.
+    Place a cylinder loss at every stud position. Problem is passed at call time so conditional
+    LEGO uses the correct brick type (N) per batch. When problem has stud_centers, use them
+    exactly; otherwise fall back to the centered grid formula.
     """
+    problem = problem if problem is not None else kwargs.get('problem')
     if not getattr(problem, 'n_studs', None) or not getattr(problem, 'stud_radius', None):
         return torch.tensor(0.0, device=z.device, dtype=z.dtype)
     from GINN.problems.sampling_primitives import sample_inside_cylinder
     device = z.device
     dtype = z.dtype
-    N_studs = problem.n_studs
-    N_studs_y = getattr(problem, 'n_studs_y', None) or 1
     stud_radius = problem.stud_radius
     if hasattr(stud_radius, 'item'):
         stud_radius = stud_radius.item()
@@ -234,26 +223,39 @@ def loss_stud_grid(z, netp, problem, n_samples_per_stud=200, safety_margin=0.05,
         stud_z_bottom = stud_z_bottom.item()
     if hasattr(stud_z_top, 'item'):
         stud_z_top = stud_z_top.item()
-    # Centered grid: same convention as problem_lego_1xN (stud_spacing=1 in normalized space)
-    # x_i = i - (N_studs-1)/2, y_j = j - (N_studs_y-1)/2
+    N_studs = problem.n_studs
+    N_studs_y = getattr(problem, 'n_studs_y', None) or 1
+
+    # Use problem's stud_centers when available (exact match to mesh/interface); else grid formula
+    if getattr(problem, 'stud_centers', None) and len(problem.stud_centers) > 0:
+        centers_list = []
+        for cx, cy in problem.stud_centers:
+            cx_val = float(cx) if hasattr(cx, 'item') else float(cx)
+            cy_val = float(cy) if hasattr(cy, 'item') else float(cy)
+            centers_list.append((cx_val, cy_val))
+    else:
+        centers_list = [
+            ((i - (N_studs - 1) / 2.0) * stud_spacing, (j - (N_studs_y - 1) / 2.0) * stud_spacing)
+            for i in range(N_studs) for j in range(N_studs_y)
+        ]
+
+    n_outside = kwargs.get('n_outside_per_stud', 0)
+    shell_thickness = kwargs.get('stud_shell_thickness', 0.05)
     loss_total = torch.tensor(0.0, device=device, dtype=dtype)
-    n_studs = 0
-    for i in range(N_studs):
-        for j in range(N_studs_y):
-            cx = (i - (N_studs - 1) / 2.0) * stud_spacing
-            cy = (j - (N_studs_y - 1) / 2.0) * stud_spacing
-            center_xy = (cx, cy)
-            loss_stud = cylinder_primitive_loss(
-                z, netp,
-                center_xy=center_xy,
-                radius=stud_radius,
-                z_bottom=stud_z_bottom,
-                z_top=stud_z_top,
-                n_samples=n_samples_per_stud,
-                safety_margin=safety_margin,
-            )
-            loss_total = loss_total + loss_stud
-            n_studs += 1
+    for center_xy in centers_list:
+        loss_stud = cylinder_primitive_loss(
+            z, netp,
+            center_xy=center_xy,
+            radius=stud_radius,
+            z_bottom=stud_z_bottom,
+            z_top=stud_z_top,
+            n_samples=n_samples_per_stud,
+            safety_margin=safety_margin,
+            n_outside=n_outside,
+            shell_thickness=shell_thickness,
+        )
+        loss_total = loss_total + loss_stud
+    n_studs = len(centers_list)
     if n_studs == 0:
         return torch.tensor(0.0, device=device, dtype=dtype)
     return loss_total / n_studs
@@ -772,46 +774,36 @@ def loss_shape_diversity(z, p_surface, diversity_type, aggregation, max_diversit
 # =============================================================================
 
 def loss_connectivity(
-    z, 
-    netp, 
-    bounds,
-    cached_connectivity_loss,
-    epoch,
-    loss_scale,
+    z,
+    netp,
+    bounds=None,
+    cached_connectivity_loss=None,
+    epoch=None,
+    loss_scale=1.0,
     **kwargs
 ) -> Scalar:
     """
-    Wrapper for connectivity loss that matches the standard loss signature.
-    
-    Uses Morse theory to find index-1 saddle points and penalizes them
-    if f(saddle) ≠ 0, encouraging connected level sets.
-    
-    Args:
-        z: Latent vectors [B, nz]
-        netp: NetWithPartials model wrapper
-        bounds: [D, 2] bounding box
-        cached_connectivity_loss: CachedConnectivityLoss instance for efficiency
-        epoch: Current training epoch
-        loss_scale: Scaling factor
-        
-    Returns:
-        Scalar connectivity loss (averaged over batch)
+    Wrapper for connectivity loss. Bounds can be passed at call time for conditional LEGO.
+    Uses cached_connectivity_loss (whose .bounds is updated in _sync_problem_dependents).
     """
     from train.losses_connectivity_v2 import CachedConnectivityLossV2 as CachedConnectivityLoss
-    
+
+    if cached_connectivity_loss is None:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    epoch = epoch if epoch is not None else kwargs.get('epoch', 0)
     loss_total = torch.tensor(0.0, device=z.device, dtype=z.dtype)
     n_shapes = z.shape[0]
-    
+
     # Process each shape in batch
     # Note: This is expensive - consider only computing for subset of batch
     for i in range(min(n_shapes, 4)):  # Limit to 4 shapes for efficiency
         z_i = z[i:i+1]  # [1, nz]
-        
+
         # Create callable for this shape
         def f_i(x):
             z_expanded = z_i.expand(len(x), -1)
             return netp(x, z_expanded)
-        
+
         loss_i, info = cached_connectivity_loss(f_i, epoch)
         loss_total = loss_total + loss_i
     

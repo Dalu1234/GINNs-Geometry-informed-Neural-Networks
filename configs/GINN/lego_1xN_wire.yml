@@ -90,31 +90,29 @@ skip_plot_epoch_0: true
 ###################
 ## Loss-balancing
 ###################
-## STUD-FOCUSED: Cuboid already good; only cuboid_primitive + stud_grid active.
-## Other losses set to 0 (originals in comments) so training focuses on improving studs.
+## Studs need a base shape: cuboid_primitive (box) + eikonal (valid SDF). Stud-only was too minimal.
 
 ## GINN losses
-objective: 'null'   # no single objective; minimize weighted sum (interface, env, eikonal, scc, curv). Was 'curv' — curvature as objective was drifting interface fit.
+objective: 'null'
 
 ## Data losses
-
 lambda_data: 0.0e+1
 lambda_lip: ${eval:1.0e-7 * 0}
 lambda_dirichlet: ${eval:1.0e1 * 0}
 
-### local (STUD-FOCUSED: most zeroed; restore from comments if needed)
-lambda_if: 0    # was 0 - shape-encoding (deprecated for LEGO)
-lambda_env: 0   # was 0 - replaced by cuboid_primitive
+### local — cuboid base + stud formation
+lambda_if: 0
+lambda_env: 0
 lambda_obst: ${eval:${vars.ginn_on} * 0.0}
-lambda_if_normal: 0   # was 0 - cuboid_primitive + eikonal provide correct normals
-lambda_cuboid_rule: 0   # was 0 - DEPRECATED: use cuboid_primitive instead
-lambda_cuboid_primitive: ${eval:${vars.ginn_on} * 10}   # KEEP: good cuboid; rule-based box
-lambda_stud_grid: ${eval:${vars.ginn_on} * 0}   # OFF for now: cylinder at every stud (i,j); set to 5 to train studs
-lambda_prior: ${eval:${vars.ginn_on} * 0}       # was 0.01 - conditional latent prior
-lambda_latent_structure: ${eval:${vars.ginn_on} * 0}   # was 0.1 - latent space health
-sample_z_from_prior_prob: 0.0   # probability of sampling z_base from prior(c) instead of buffer/sampler (0 = off)
-prior_hidden: [32, 32]          # MLP hidden dims for prior: c -> mu, log_sigma
-prior_min_sigma: 1.0e-3         # minimum sigma for numerical stability
+lambda_if_normal: 0
+lambda_cuboid_rule: 0
+lambda_cuboid_primitive: ${eval:${vars.ginn_on} * 10}   # base box so field has coherent shape
+lambda_stud_grid: ${eval:${vars.ginn_on} * 10}         # cylinders on top for studs
+lambda_prior: ${eval:${vars.ginn_on} * 0}
+lambda_latent_structure: ${eval:${vars.ginn_on} * 0}
+sample_z_from_prior_prob: 0.0
+prior_hidden: [32, 32]
+prior_min_sigma: 1.0e-3
 
 # Cuboid primitive loss settings (rule-based box learning)
 # Total ~2000 pts (was 5000 - reduced for speed)
@@ -128,6 +126,8 @@ cuboid_boundary_weight: 0.5  # weight for boundary sharpening term
 
 # Stud grid loss (cylinder at every stud position → compositional rule for 1xN generalization)
 stud_grid_n_samples: 200     # samples per stud cylinder
+stud_grid_n_outside: 40      # fewer outside samples to reduce inward pull
+stud_grid_shell_thickness: 0.02   # thinner shell: [radius, radius+this] in normalized space
 stud_grid_safety_margin: 0.05
 stud_spacing_normalized: 1.0 # in normalized LEGO space; 1 unit = one stud spacing
 
@@ -137,11 +137,11 @@ latent_max_magnitude: 3.0     # maximum |z| per dim (prevent explosion)
 latent_diversity_weight: 1.0  # weight for SDF-based diversity term
 latent_n_diversity_pts: 100   # points for SDF comparison across z
 
-### global (STUD-FOCUSED: zeroed; restore from comments if needed)
-lambda_eikonal: ${eval:${vars.ginn_on} * 1.0}  # valid SDF gradient norm
-lambda_scc: ${eval:${vars.ginn_on} * 35}       # single connected mesh
-lambda_curv: 0   # was 0 - off for LEGO
-lambda_div: 0   # was 0 - off for this run
+### global — eikonal needed so SDF is valid and zero-level set is sharp
+lambda_eikonal: ${eval:${vars.ginn_on} * 1.0}
+lambda_scc: ${eval:${vars.ginn_on} * 0}
+lambda_curv: 0
+lambda_div: 0
 
 max_curv: 0 # 180 # 500
 max_div: -0.1
@@ -261,15 +261,15 @@ timer:
 problem:
   problem_str: ${vars.problem_str}
   n_studs: 2  # LEGO-specific: default when not conditioning (1x2); ignored when condition_on_n_studs is true (N sampled per batch)
-  no_studs: true   # temporary: cuboid only (no studs); set false to restore studs
+  no_studs: false  # must be false for stud formation: bounds and mesh extraction include stud volume; stud_grid loss aligns with output
 
 problem_sampling:
   ## Number of points to sample (conservative for 8GB GPU to avoid crashes)
   nx: ${vars.nx}
   n_points_domain: 2048   # eikonal loss
   n_points_envelope: 8192   # was 12288; reduced for 8GB
-  n_points_interfaces: 4096  # was 6144
-  n_points_normals: 4096     # match interfaces
+  n_points_interfaces: 10000  # 5k to studs, 5k to walls (50/50 in sample_from_interface)
+  n_points_normals: 10000     # match interfaces
   n_points_surface: ${vars.n_points_surface}
 
 ###################
@@ -297,12 +297,13 @@ save_every_n_epochs: 10
 overwrite_existing_saved_model: true   # overwrite same files in run dir (one model.pt, one optim.pt); false = many ...-it_00010-model.pt
 save_optimizer: true
 
-## Weight loading (train on top of specific run)
-load_mos: true   # load model, optimizer, scheduler
+## Weight loading (train from scratch = no load; resume = set load_* true and model_load_path)
+load_mos: true   # true = load model + optimizer + scheduler from path
 load_model: true
 load_optimizer: true
 load_scheduler: true
-model_load_path: 'path/to/dir/cond_wire/2026_02_03__22_28_55-89jdkw55/2026_02_03__22_28_55-89jdkw55-model.pt'
-# model_load_latest: true  # off when using model_load_path
-resume_same_run_dir: false  # false = new folder for this training session; true = save into loaded run dir
+#model_load_path: 'path/to/dir/cond_wire/2026_02_04__20_31_09-tiy5hqdl/2026_02_04__20_31_09-tiy5hqdl-model.pt'
+model_load_path: 'path/to/dir/cond_wire/2026_02_05__02_02_38-3k34l224/2026_02_05__02_02_38-3k34l224-model.pt'
+#model_load_latest: true  # find latest *-model.pt under model_save_path/model_str
+resume_same_run_dir: false  # false = new folder for this run; true = save into loaded run dir
 # model_load_wandb_id: 'mb8z12t1'

@@ -673,13 +673,17 @@ class Trainer():
                 loss_dict[LossKey('vol')] = (batch_V.mean(), batch_dVdrho)
                 field_dict[LossKey('vol')] = rho_batch
         
-        ## compute scalar sublosses
+        ## compute scalar sublosses (pass current problem/bounds so conditional LEGO uses correct brick type per batch)
+        step_kw = dict(z=z, z_corners=z_corners, p=self.p, epoch=epoch, batch=batch,
+                      p_surface=self.p_surface, weights_surf_pts=self.weights_surf_pts, x_fem=x_fem,
+                      problem=self.problem, bounds=getattr(self.problem, 'bounds', None),
+                      n_outside_per_stud=self.config.get('stud_grid_n_outside', 50),
+                      stud_shell_thickness=self.config.get('stud_grid_shell_thickness', 0.05))
         for key in self.scalar_loss_keys:
             if epoch < self.config.get('start_'+key.base_key, 0):
                 loss_dict[key] = torch.tensor(0.0)
             else:
-                loss_dict[key] = self.loss_dispatcher[key.base_key](z=z, z_corners=z_corners, p=self.p,
-                        epoch=epoch, batch=batch, p_surface=self.p_surface, weights_surf_pts=self.weights_surf_pts, x_fem=x_fem)
+                loss_dict[key] = self.loss_dispatcher[key.base_key](**step_kw)
 
         ## compute total loss
         loss = self.loss_calculator.compute_loss_and_save_sublosses(loss_dict)
@@ -750,8 +754,8 @@ class Trainer():
             'if': partial(loss_if, netp=self.netp, p_sampler=self.problem, level_set=self.config['level_set']),
             'if_normal': partial(loss_if_normal, netp=self.netp, p_sampler=self.problem, ginn_bsize=self.config['ginn_bsize'], loss_scale=self.config.get('scale_if_normal', 1), nf_is_density=self.config['nf_is_density']),
             'cuboid_rule': partial(loss_cuboid_rule, netp=self.netp, p_sampler=self.problem, level_set=self.config['level_set'], nf_is_density=self.config['nf_is_density']),
-            # NEW: Rule-based cuboid primitive loss with stratified sampling and boundary sharpening
-            'cuboid_primitive': partial(loss_cuboid_primitive, netp=self.netp, bounds=self.problem.bounds,
+            # NEW: Rule-based cuboid primitive loss (bounds passed at call time for conditional LEGO)
+            'cuboid_primitive': partial(loss_cuboid_primitive, netp=self.netp,
                                         n_inside=self.config.get('cuboid_n_inside', 2000),
                                         n_near_faces=self.config.get('cuboid_n_near_faces', 1000),
                                         n_corners=self.config.get('cuboid_n_corners', 500),
@@ -759,8 +763,8 @@ class Trainer():
                                         n_boundary=self.config.get('cuboid_n_boundary', 1000),
                                         safety_margin=self.config.get('cuboid_safety_margin', 0.1),
                                         boundary_weight=self.config.get('cuboid_boundary_weight', 0.5)),
-            # Stud grid: cylinder at every (i,j) → compositional rule for generalization to any N
-            'stud_grid': partial(loss_stud_grid, netp=self.netp, problem=self.problem,
+            # Stud grid: cylinder at every stud (problem passed at call time for correct N per batch)
+            'stud_grid': partial(loss_stud_grid, netp=self.netp,
                                         n_samples_per_stud=self.config.get('stud_grid_n_samples', 200),
                                         safety_margin=self.config.get('stud_grid_safety_margin', 0.05),
                                         stud_spacing=self.config.get('stud_spacing_normalized', 1.0)),
@@ -800,10 +804,9 @@ class Trainer():
                                        max_diversity=self.config.get('max_diversity', None),
                                        loss_scale=self.config.get('scale_shape_diversity', 1.0)),
             
-            # Connectivity loss (Morse theory) for generative training
+            # Connectivity loss (bounds passed at call time for conditional LEGO)
             'connectivity': partial(loss_connectivity,
                                     netp=self.netp,
-                                    bounds=self.problem.bounds,
                                     cached_connectivity_loss=self.cached_connectivity_loss,
                                     loss_scale=self.config.get('scale_connectivity', 1.0)),
            

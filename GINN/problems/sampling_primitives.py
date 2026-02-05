@@ -156,6 +156,36 @@ def sample_inside_cylinder(center_xy, radius, z_bottom, z_top, n, device=None):
     return pts[:n]
 
 
+def sample_outside_cylinder_shell(center_xy, radius_inner, radius_outer, z_bottom, z_top, n, device=None):
+    """
+    Sample n points in a thin shell just outside a vertical cylinder (annulus in xy).
+    Used to push SDF > 0 outside the stud so the zero-level set is at the cylinder boundary.
+    """
+    if device is None:
+        device = center_xy.device if hasattr(center_xy, 'device') else torch.device('cpu')
+    center_xy = torch.as_tensor(center_xy, device=device, dtype=torch.float32)
+    if center_xy.dim() == 0:
+        center_xy = center_xy.unsqueeze(0).expand(2)
+    ri, ro = float(radius_inner), float(radius_outer)
+    z_bottom, z_top = float(z_bottom), float(z_top)
+    n_try = max(n * 4, 500)
+    # sample in box [center - ro, center + ro] x [z_bottom, z_top], keep annulus ri < r < ro
+    xy = center_xy + (2 * ro) * (torch.rand(n_try, 2, device=device) - 0.5)
+    z_pts = z_bottom + (z_top - z_bottom) * torch.rand(n_try, 1, device=device)
+    pts = torch.cat([xy, z_pts], dim=1)
+    dist_xy = torch.norm(pts[:, :2] - center_xy.unsqueeze(0), dim=1)
+    in_shell = (dist_xy >= ri) & (dist_xy <= ro)
+    pts = pts[in_shell]
+    while pts.shape[0] < n:
+        xy = center_xy + (2 * ro) * (torch.rand(n_try, 2, device=device) - 0.5)
+        z_pts = z_bottom + (z_top - z_bottom) * torch.rand(n_try, 1, device=device)
+        pts2 = torch.cat([xy, z_pts], dim=1)
+        dist_xy = torch.norm(pts2[:, :2] - center_xy.unsqueeze(0), dim=1)
+        in_shell = (dist_xy >= ri) & (dist_xy <= ro)
+        pts = torch.cat([pts, pts2[in_shell]], dim=0)
+    return pts[:n]
+
+
 # =============================================================================
 # BOX PRIMITIVE SAMPLING (for rule-based cuboid loss)
 # =============================================================================

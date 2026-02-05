@@ -1,0 +1,302 @@
+FEM:
+  poisson_ratio: 0.25
+  traction_bs_F:
+  - 0
+  - -1
+  traction_bs_x: -1
+  traction_bs_y1: 0.4
+  traction_bs_y2: 0.6
+  youngs_modulus: 100
+adaptive_penalty:
+  alpha: 0.9
+  epsilon: 1.0e-08
+  gamma: 0.01
+args_str: ''
+condition_on_height: true
+condition_on_n_studs: true
+condition_on_n_studs_y: true
+connectivity_grad_tol: 0.01
+connectivity_n_iter: 30
+connectivity_n_samples: 1000
+connectivity_update_every_n_epochs: 50
+cuboid_boundary_weight: 0.5
+cuboid_n_boundary: 400
+cuboid_n_corners: 200
+cuboid_n_far: 200
+cuboid_n_inside: 800
+cuboid_n_near_faces: 400
+cuboid_safety_margin: 0.1
+curvature_expression: 4*H**2 - 2*K
+curvature_pts_source: surface
+curvature_use_gradnorm_weights: false
+data:
+  data_dir: /system/user/publicdata/simjeb_preprocessed/occ_sds
+decay_steps: 5000
+dirichlet_use_surface_points: true
+div_neighbor_agg_fn: min
+div_norm_order: 2
+diversity_aggregation: min
+diversity_pts_source: surface
+diversity_type: chamfer
+exclude_surface_points_close_to_interface_cutoff: 0.04
+field_losses:
+- comp
+- vol
+- chamfer_div
+- wasserstein_div
+ginn_bsize: 4
+gpu_list: 0
+grad_clipping:
+  auto_clip_hist_len: 50
+  auto_clip_min_len: 50
+  auto_clip_on: true
+  auto_clip_percentile: 0.8
+  grad_clip: 0.5
+  grad_clipping_on: true
+height_values:
+- 1.0
+lambda_chamfer_div: 0
+lambda_comp: 0
+lambda_connectivity: 0
+lambda_cuboid_primitive: 10
+lambda_cuboid_rule: 0
+lambda_curv: 0
+lambda_data: 0.0
+lambda_dirichlet: 0.0
+lambda_div: 0
+lambda_eikonal: 1.0
+lambda_env: 0
+lambda_if: 0
+lambda_if_normal: 0
+lambda_latent_structure: 0
+lambda_lip: 0.0
+lambda_obst: 0.0
+lambda_prior: 0
+lambda_rotsym: 0
+lambda_scc: 35
+lambda_shape_diversity: 0
+lambda_stud_grid: 10
+lambda_vol: 0
+latent_diversity_weight: 1.0
+latent_max_magnitude: 3.0
+latent_min_variance: 0.1
+latent_n_diversity_pts: 100
+latent_sampling:
+  ginn_bsize: 4
+  nz: 2
+  val_plot_grid:
+  - 3
+  - 3
+  z_sample_interval:
+  - 0
+  - 0.1
+  z_sample_method: uniform
+level_set: 0.0
+load_model: false
+load_mos: false
+load_optimizer: false
+load_scheduler: false
+log_level: INFO
+lr: 0.001
+max_curv: 0
+max_div: -0.1
+max_epochs: 5000
+meshing:
+  level_set: 0.0
+  max_points_per_batch: 32768
+  mc_chunks: 1
+  mc_resolution: 256
+  mesh_reduction: 0
+  nf_is_density: false
+metrics:
+  chamfer_metrics_vectorize: true
+  metrics_chamfer_orders:
+  - 2
+  metrics_diversity_inner_agg_fns:
+  - sum
+  metrics_diversity_n_samples: 1000
+  metrics_diversity_outer_agg_fns:
+  - sum
+  metrics_diversity_ps:
+  - 0.5
+  shape_metrics_every_n_epochs: 1000000
+  val_shape_metrics_every_n_epochs: 1000000
+model:
+  c_dim: 3
+  density_iso_level: 0.05
+  group_size_fwd_no_grad: 2097152
+  hypernet_hidden:
+  - 64
+  - 64
+  - 32
+  layers:
+  - 256
+  - 256
+  - 256
+  - 256
+  lora_init_scale: 0.01
+  lora_rank: 16
+  model_str: cond_wire
+  n_studs_values:
+  - 2
+  - 4
+  - 5
+  - 8
+  - 12
+  nx: 3
+  ny: 1
+  nz: 2
+  return_density: false
+  stud_spacing_normalized: 1.0
+  use_density: false
+  use_dist_to_edge: true
+  use_hypernet: false
+  use_tiled_coords: true
+  w0: 1.0
+  w0_initial: 18
+  wire_scale: 6
+model_save_path: path/to/dir
+n_points_data: -1
+n_studs_values:
+- 2
+- 4
+- 5
+- 8
+- 12
+n_studs_y_values:
+- 1
+nf_is_density: false
+num_workers: 9
+nx: 3
+nz: 2
+objective: 'null'
+opt: adam
+overwrite_existing_saved_model: true
+ph:
+  evaluate_ph_grid_per_shape: true
+  ginn_bsize: 4
+  is_density: false
+  iso_level: -0.02
+  nx: 3
+  ph_1_hole_level: 0.06
+  ph_loss_maxdim: 1
+  ph_loss_sub0_points: false
+  ph_loss_super0_points: false
+  ph_loss_target_betti:
+  - 1
+  - 0
+  - 0
+  ph_max_num_workers: 4
+  problem_str: lego_1xN
+  scc_n_grid_points: 32
+  scc_penalty_norm_eps: 0.0001
+  simjeb_root_dir: GINN/simJEB/data
+plot:
+  fig_size:
+  - 12
+  - 7
+  fig_wandb: true
+  level_set: 0.0
+  plot_2d_resolution: 100
+  problem_str: lego_1xN
+  show_colorbar: true
+  val_plot_grid:
+  - 3
+  - 3
+plot_every_n_epochs: 100
+plot_ph_diagram: true
+plot_shape: true
+plot_surface_points: true
+plot_surface_pts_every_n_epochs: 100
+prior_hidden:
+- 32
+- 32
+prior_min_sigma: 0.001
+problem:
+  n_studs: 2
+  no_studs: false
+  problem_str: lego_1xN
+  rotation_n_cycles: 0
+  simjeb_root_dir: GINN/simJEB/data
+problem_sampling:
+  n_points_domain: 2048
+  n_points_envelope: 8192
+  n_points_interfaces: 4096
+  n_points_normals: 4096
+  n_points_surface: 20000
+  nx: 3
+reset_zlatents_every_n_epochs: 1
+resume_same_run_dir: false
+sample_z_from_prior_prob: 0.0
+save_every_n_epochs: 10
+save_model_dir: path/to/dir\cond_wire\2026_02_04__23_07_50-37wct5dj
+save_optimizer: true
+scale_chamfer_div: 1
+scale_comp: 1
+scale_connectivity: 1.0
+scale_curv: 0.0005
+scale_div: 0.03
+scale_eikonal: 0.01
+scale_if_normal: 1
+scale_shape_diversity: 1.0
+scale_vol: 1
+scheduler_gamma: 0.5
+seed: 11
+skip_plot_epoch_0: true
+start_connectivity: 1000
+start_curv: 500
+start_div: 2000
+strain_curvature_clip_max: 1000000.0
+stud_grid_n_samples: 200
+stud_grid_safety_margin: 0.05
+stud_spacing_normalized: 1.0
+surface:
+  bin_search_steps: 10
+  do_numerical_surface_points: false
+  do_uniform_resampling: true
+  equidistant_init_grid: true
+  level_set: 0.0
+  n_points_surface: 20000
+  nx: 3
+  recompute_every_n_epochs: 1
+  surf_pts_converged_interval: 1
+  surf_pts_do_uniform_resampling: true
+  surf_pts_inflate_bounds_amount: 0.05
+  surf_pts_lr: 0.01
+  surf_pts_n_iter: 10
+  surf_pts_newton_clip: 0.15
+  surf_pts_prec_eps: 0.001
+  surf_pts_surpress_tqdm: true
+  surf_pts_uniform_min_count: 1000
+  surf_pts_uniform_n_iter: 10
+  surf_pts_uniform_n_iter_reproj: 5
+  surf_pts_uniform_nof_neighbours: 16
+  surf_pts_uniform_prec_eps: 0.001
+  surf_pts_uniform_reproject_surpress_tqdm: true
+  surf_pts_uniform_stepsize: 0.75
+  surf_pts_use_newton: true
+timer:
+  accumulate: true
+  print: false
+timer_accumulate: true
+timer_print: false
+train_plot_max_n_shapes: 9
+training_mode: single
+use_augmented_lagrangian: true
+use_scheduler: false
+val_plot_shape: true
+valid_every_n_epochs: 200
+violation_buffer:
+  block_epochs_per_type: 0
+  eps: 1.0e-08
+  initial_size_per_c: 50
+  random_fraction: 0.1
+  sample_temperature: 1.0
+  use: true
+wandb_entity_name: daludk-star-labs
+wandb_experiment_name: lego_1xN_cond_wire
+wandb_id: 37wct5dj
+wandb_project_name: topginn
+weight_rescale_alpha: 0.9
+weight_rescale_interval: 100
+weight_rescale_on: false
