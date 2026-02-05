@@ -106,11 +106,11 @@ lambda_env: 0
 lambda_obst: ${eval:${vars.ginn_on} * 0.0}
 lambda_if_normal: 0
 lambda_cuboid_rule: 0
-lambda_cuboid_primitive: ${eval:${vars.ginn_on} * 10}   # base box so field has coherent shape
-lambda_stud_grid: ${eval:${vars.ginn_on} * 10}         # cylinders on top for studs
-lambda_prior: ${eval:${vars.ginn_on} * 0}
-lambda_latent_structure: ${eval:${vars.ginn_on} * 0}
-sample_z_from_prior_prob: 0.0
+lambda_cuboid_primitive: ${eval:${vars.ginn_on} * 2}   # base box so field has coherent shape
+lambda_stud_grid: ${eval:${vars.ginn_on} * 3}         # cylinders on top for studs
+lambda_prior: ${eval:${vars.ginn_on} * 0.01}   # small: train prior so sample_z_from_prior_prob can sample z ~ p(z|c)
+lambda_latent_structure: ${eval:${vars.ginn_on} * 0.01}   # prevent collapse, cap magnitude, encourage diversity
+sample_z_from_prior_prob: 0.3   # 30% of batches: sample z_base from prior (only when lambda_prior > 0)
 prior_hidden: [32, 32]
 prior_min_sigma: 1.0e-3
 
@@ -161,7 +161,7 @@ scale_div: 0.03
 scale_chamfer_div: 1
 scale_vol: 1
 scale_comp: 1
-scale_eikonal: 0.01
+scale_eikonal: 0.5
 scale_if_normal: 1
 
 dirichlet_use_surface_points: true
@@ -298,12 +298,12 @@ overwrite_existing_saved_model: true   # overwrite same files in run dir (one mo
 save_optimizer: true
 
 ## Weight loading (train from scratch = no load; resume = set load_* true and model_load_path)
-load_mos: true   # true = load model + optimizer + scheduler from path
-load_model: true
-load_optimizer: true
-load_scheduler: true
+load_mos: false   # true = load model + optimizer + scheduler from path
+load_model: false
+load_optimizer: false
+load_scheduler: false
 #model_load_path: 'path/to/dir/cond_wire/2026_02_04__20_31_09-tiy5hqdl/2026_02_04__20_31_09-tiy5hqdl-model.pt'
-model_load_path: 'path/to/dir/cond_wire/2026_02_05__02_02_38-3k34l224/2026_02_05__02_02_38-3k34l224-model.pt'
+#model_load_path: 'path/to/dir/cond_wire/2026_02_05__02_02_38-3k34l224/2026_02_05__02_02_38-3k34l224-model.pt'
 #model_load_latest: true  # find latest *-model.pt under model_save_path/model_str
 resume_same_run_dir: false  # false = new folder for this run; true = save into loaded run dir
 # model_load_wandb_id: 'mb8z12t1'

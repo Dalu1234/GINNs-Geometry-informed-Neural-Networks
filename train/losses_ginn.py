@@ -170,6 +170,29 @@ def loss_cuboid_primitive(z, netp, bounds=None, n_inside=2000, n_near_faces=1000
 
 
 # =============================================================================
+# PARAMETRIC STUD CENTERS (rule-based, no precomputed point clouds)
+# Matches ProblemLego1xN convention: brick_length = n_studs * spacing - inset_mm/scale
+# =============================================================================
+def _stud_centers_parametric(n_studs: int, n_studs_y: int, stud_spacing: float = 1.0,
+                             lego_inset_norm: float = 0.025) -> typing.List[typing.Tuple[float, float]]:
+    """
+    Compute stud center (x, y) in normalized space from parameters only.
+    Same rule as ProblemLego1xN: first stud at -half_length + spacing/2, then regular grid.
+    lego_inset_norm = 0.2mm / 8mm = 0.025 so brick_length_norm = n_studs - 0.025.
+    """
+    half_length_x = (n_studs * stud_spacing - lego_inset_norm) * 0.5
+    first_x = -half_length_x + stud_spacing * 0.5
+    if n_studs_y is None or n_studs_y <= 1:
+        return [(first_x + i * stud_spacing, 0.0) for i in range(n_studs)]
+    half_length_y = (n_studs_y * stud_spacing - lego_inset_norm) * 0.5
+    first_y = -half_length_y + stud_spacing * 0.5
+    return [
+        (first_x + i * stud_spacing, first_y + j * stud_spacing)
+        for i in range(n_studs) for j in range(n_studs_y)
+    ]
+
+
+# =============================================================================
 # CYLINDER PRIMITIVE LOSS (for studs: SDF < 0 inside each cylinder)
 # Used by loss_stud_grid to teach "cylinder at every grid position" → generalizes to any N
 # =============================================================================
@@ -204,40 +227,54 @@ def cylinder_primitive_loss(z, netp, center_xy, radius, z_bottom, z_top, n_sampl
 
 def loss_stud_grid(z, netp, problem=None, n_samples_per_stud=200, safety_margin=0.05, stud_spacing=1.0, **kwargs) -> Scalar:
     """
-    Place a cylinder loss at every stud position. Problem is passed at call time so conditional
-    LEGO uses the correct brick type (N) per batch. When problem has stud_centers, use them
-    exactly; otherwise fall back to the centered grid formula.
+    Parametric stud grid loss: cylinder at every stud position.
+    Stud centers are computed from (N, N_y, stud_spacing) at call time—no precomputed
+    point clouds. Supports both problem-based calls (LEGO) and direct (n_studs, n_studs_y)
+    for unseen N. Geometry (radius, z extents) from problem when present, else kwargs.
     """
     problem = problem if problem is not None else kwargs.get('problem')
-    if not getattr(problem, 'n_studs', None) or not getattr(problem, 'stud_radius', None):
-        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
-    from GINN.problems.sampling_primitives import sample_inside_cylinder
     device = z.device
     dtype = z.dtype
-    stud_radius = problem.stud_radius
-    if hasattr(stud_radius, 'item'):
-        stud_radius = stud_radius.item()
-    stud_z_bottom = problem.stud_z_bottom
-    stud_z_top = problem.stud_z_top
-    if hasattr(stud_z_bottom, 'item'):
-        stud_z_bottom = stud_z_bottom.item()
-    if hasattr(stud_z_top, 'item'):
-        stud_z_top = stud_z_top.item()
-    N_studs = problem.n_studs
-    N_studs_y = getattr(problem, 'n_studs_y', None) or 1
 
-    # Use problem's stud_centers when available (exact match to mesh/interface); else grid formula
-    if getattr(problem, 'stud_centers', None) and len(problem.stud_centers) > 0:
-        centers_list = []
-        for cx, cy in problem.stud_centers:
-            cx_val = float(cx) if hasattr(cx, 'item') else float(cx)
-            cy_val = float(cy) if hasattr(cy, 'item') else float(cy)
-            centers_list.append((cx_val, cy_val))
-    else:
-        centers_list = [
-            ((i - (N_studs - 1) / 2.0) * stud_spacing, (j - (N_studs_y - 1) / 2.0) * stud_spacing)
-            for i in range(N_studs) for j in range(N_studs_y)
-        ]
+    # Resolve N, N_y: from problem or explicit kwargs (for parametric / unseen N)
+    n_studs = kwargs.get('n_studs')
+    n_studs_y = kwargs.get('n_studs_y')
+    if problem is not None:
+        if getattr(problem, 'n_studs', None) is None and n_studs is None:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        if n_studs is None:
+            n_studs = problem.n_studs
+        if n_studs_y is None:
+            n_studs_y = getattr(problem, 'n_studs_y', None) or 1
+    if n_studs is None or n_studs < 1:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+    if n_studs_y is None:
+        n_studs_y = 1
+
+    # Geometry: from problem when available, else kwargs (allows calling without problem)
+    stud_radius = kwargs.get('stud_radius')
+    stud_z_bottom = kwargs.get('stud_z_bottom')
+    stud_z_top = kwargs.get('stud_z_top')
+    if problem is not None and getattr(problem, 'stud_radius', None) is not None:
+        if stud_radius is None:
+            stud_radius = problem.stud_radius
+        if stud_z_bottom is None:
+            stud_z_bottom = problem.stud_z_bottom
+        if stud_z_top is None:
+            stud_z_top = problem.stud_z_top
+    if stud_radius is None or stud_z_bottom is None or stud_z_top is None:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+    stud_radius = float(stud_radius.item() if hasattr(stud_radius, 'item') else stud_radius)
+    stud_z_bottom = float(stud_z_bottom.item() if hasattr(stud_z_bottom, 'item') else stud_z_bottom)
+    stud_z_top = float(stud_z_top.item() if hasattr(stud_z_top, 'item') else stud_z_top)
+
+    # Parametric rule: centers from N, N_y, spacing (matches ProblemLego1xN convention)
+    lego_inset_norm = kwargs.get('lego_inset_norm', 0.025)
+    centers_list = _stud_centers_parametric(
+        n_studs, n_studs_y, stud_spacing, lego_inset_norm=lego_inset_norm
+    )
+    if not centers_list:
+        return torch.tensor(0.0, device=device, dtype=dtype)
 
     n_outside = kwargs.get('n_outside_per_stud', 0)
     shell_thickness = kwargs.get('stud_shell_thickness', 0.05)
@@ -255,10 +292,7 @@ def loss_stud_grid(z, netp, problem=None, n_samples_per_stud=200, safety_margin=
             shell_thickness=shell_thickness,
         )
         loss_total = loss_total + loss_stud
-    n_studs = len(centers_list)
-    if n_studs == 0:
-        return torch.tensor(0.0, device=device, dtype=dtype)
-    return loss_total / n_studs
+    return loss_total / len(centers_list)
 
 
 # Keep old loss_cuboid_rule for backward compatibility (deprecated)
