@@ -762,6 +762,10 @@ class Trainer():
         for key in self.scalar_loss_keys:
             if epoch < self.config.get('start_'+key.base_key, 0):
                 loss_dict[key] = torch.tensor(0.0)
+            elif (key.base_key == 'unseen_violation'
+                  and 'unseen_violation_every_n_epochs' in self.config
+                  and not is_every_n_epochs_fulfilled(epoch, self.config, 'unseen_violation_every_n_epochs')):
+                loss_dict[key] = torch.tensor(0.0, device=step_kw['z'].device, dtype=step_kw['z'].dtype)
             else:
                 loss_dict[key] = self.loss_dispatcher[key.base_key](**step_kw)
 
@@ -866,6 +870,17 @@ class Trainer():
                                         n_z_samples=self.config.get('unseen_eval_n_z_samples', 4),
                                         level_set=self.config['level_set'],
                                         nf_is_density=self.config['nf_is_density']),
+            # Interpolation midpoint: eikonal + smooth-z at z_mid between two brick types; sample near zero-level set
+            'interp_midpoint': partial(loss_interp_midpoint, netp=self.netp, p_sampler=self.problem,
+                                        _build_z_for_n=self._build_z_for_n,
+                                        n_studs_values=getattr(self, 'n_studs_values', []),
+                                        level_set=self.config['level_set'],
+                                        nf_is_density=self.config['nf_is_density'],
+                                        interp_near_threshold=self.config.get('interp_near_threshold', 0.1),
+                                        interp_n_domain_calls=self.config.get('interp_n_domain_calls', 4),
+                                        interp_min_near_points=self.config.get('interp_min_near_points', 32),
+                                        scale_interp_eikonal=self.config.get('scale_interp_eikonal', 1.0),
+                                        scale_interp_smooth_z=self.config.get('scale_interp_smooth_z', 0.1)),
             
             # global
             'eikonal': partial(loss_eikonal, p_sampler=self.problem, netp=self.netp, scale_eikonal=self.config.get('scale_eikonal', 1), nf_is_density=self.config['nf_is_density']),

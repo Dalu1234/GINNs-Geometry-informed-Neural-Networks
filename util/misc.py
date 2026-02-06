@@ -203,7 +203,7 @@ def get_model(model_str, nx, nz, layers, ny=1, activation=None, w0=None, w0_init
             wire_kw['stud_spacing'] = wire_kw.pop('stud_spacing_normalized', 1.0)
         if 'stud_spacing_y_normalized' in wire_kw:
             wire_kw['stud_spacing_y'] = wire_kw.pop('stud_spacing_y_normalized')
-        model = ConditionalWIRE(layers=layers, first_omega_0=w0_initial, hidden_omega_0=w0, scale=wire_scale, **wire_kw)
+        model = ConditionalWIRE(layers=layers, first_omega_0=w0_initial, hidden_omega_0=w0, scale=wire_scale, nz=nz, **wire_kw)
     elif model_str == 'grid_mock':
         model = ConditionalGridMock(**kwargs)
     elif model_str == 'general_net':

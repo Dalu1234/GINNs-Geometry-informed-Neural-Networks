@@ -53,13 +53,20 @@ def deep_update(original, updates, print_overwrites=True):
             original[key] = value
     return original
 
+def _strip_control_chars(s):
+    """Remove ASCII control characters (e.g. 0x02 from accidental Ctrl+B) so YAML parse does not fail."""
+    if not isinstance(s, str):
+        return s
+    return ''.join(c for c in s if ord(c) >= 32 or c in '\t\n\r')
+
+
 def cli_args_2_flat_dict(args):
     
     res = {}
 
     for kv in args:
         keys, value = kv.split('=', 1)
-        res[keys] = value    
+        res[_strip_control_chars(keys)] = _strip_control_chars(value)
     return res
 
 def cli_args_2_nested_dict(args):

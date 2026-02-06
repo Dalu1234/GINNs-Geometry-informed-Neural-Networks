@@ -27,8 +27,9 @@ vars:
   nf_is_density: false
   level_set: 0.0
   # Unseen-N evaluation: every K epochs compute metric on fixed unseen N (e.g. 3, 6, 7) for generalization monitoring
-  unseen_n_studs: [3, 6, 7]   # N not in n_studs_values; set [] to disable
+  unseen_n_studs: [3, 6, 7, 10 ,13]   # N not in n_studs_values; set [] to disable
   unseen_eval_every_n_epochs: 50
+  unseen_violation_every_n_epochs: 10  # run unseen_violation loss every N epochs (saves cost; omit to run every step)
   unseen_eval_metric: 'violation'   # 'violation' = mean interface+envelope loss; 'chamfer' = mean Chamfer to rule mesh (if implemented)
   unseen_eval_n_z_samples: 2       # z samples per unseen N for violation mean
 
@@ -49,6 +50,7 @@ condition_on_height: ${vars.condition_on_height}
 height_values: ${vars.height_values}
 unseen_n_studs: ${vars.unseen_n_studs}
 unseen_eval_every_n_epochs: ${vars.unseen_eval_every_n_epochs}
+unseen_violation_every_n_epochs: ${vars.unseen_violation_every_n_epochs}
 unseen_eval_metric: ${vars.unseen_eval_metric}
 unseen_eval_n_z_samples: ${vars.unseen_eval_n_z_samples}
 
@@ -75,6 +77,10 @@ model:
   lora_init_scale: 0.01
   # Regularization: dropout after hidden layers to reduce overfitting
   dropout_p: 0.05
+  # FiLM: re-inject z at selected layers so conditioning is not washed out (better interpolation/generalization)
+  use_film: true
+  film_after_layers: [0, 2]   # after 1st and 2nd Gabor layer (0-indexed in backbone)
+  film_hidden: 64             # hidden dim of gamma/beta MLPs
 
 reset_zlatents_every_n_epochs: 1  # uncomment to set; not set means the latents are kept fix
 latent_sampling:
@@ -128,7 +134,14 @@ lambda_phantom_stud: ${eval:${vars.ginn_on} * 0.5}    # rule-enforcement: penali
 lambda_outside_brick_sdf: ${eval:${vars.ginn_on} * 0.3}   # outside brick (dist_to_edge < -margin) → push SDF > margin
 lambda_prior: ${eval:${vars.ginn_on} * 0.01}   # small: train prior so sample_z_from_prior_prob can sample z ~ p(z|c)
 lambda_latent_structure: ${eval:${vars.ginn_on} * 0.01}   # prevent collapse, cap magnitude, encourage diversity
-lambda_unseen_violation: 0.5   # penalize poor constraint satisfaction on unseen N (e.g. 3, 6, 7); set > 0 to enable
+lambda_unseen_violation: 1   # penalize poor constraint satisfaction on unseen N (e.g. 3, 6, 7); set > 0 to enable
+# Interpolation midpoint loss: eikonal + smooth-z at z_mid between two brick types; sample near zero-level set
+lambda_interp_midpoint: 0.3    # set > 0 to enable (e.g. 0.1); encourages valid/smooth decoding at 1x3-like z
+interp_near_threshold: 0.1     # keep x where |f(x,z_mid) - level_set| < this (near zero-level set)
+interp_n_domain_calls: 2       # number of domain samples to concat (more → better near-surface coverage)
+interp_min_near_points: 32    # if fewer points pass near filter, use all domain points
+scale_interp_eikonal: 1.0     # weight for eikonal term at z_mid
+scale_interp_smooth_z: 0.1    # weight for ||∇_z f|| penalty (smooth interpolation in z)
 sample_z_from_prior_prob: 0.3   # 30% of batches: sample z_base from prior (only when lambda_prior > 0)
 prior_hidden: [32, 32]
 prior_min_sigma: 1.0e-3
@@ -322,12 +335,12 @@ overwrite_existing_saved_model: true   # overwrite same files in run dir (one mo
 save_optimizer: true
 
 ## Weight loading (train from scratch = no load; resume = set load_* true and model_load_path)
-load_mos: false   # true = load model + optimizer + scheduler from path
-load_model: false
-load_optimizer: false
-load_scheduler: false
+load_mos: true   # true = load model + optimizer + scheduler from path
+load_model: true
+load_optimizer: true
+load_scheduler: true
 #model_load_path: 'path/to/dir/cond_wire/2026_02_04__20_31_09-tiy5hqdl/2026_02_04__20_31_09-tiy5hqdl-model.pt'
 #model_load_path: 'path/to/dir/cond_wire/2026_02_05__02_02_38-3k34l224/2026_02_05__02_02_38-3k34l224-model.pt'
-#model_load_latest: true  # find latest *-model.pt under model_save_path/model_str
+model_load_latest: true  # find latest *-model.pt under model_save_path/model_str
 resume_same_run_dir: false  # false = new folder for this run; true = save into loaded run dir
 # model_load_wandb_id: 'mb8z12t1'

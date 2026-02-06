@@ -176,7 +176,34 @@ class WIRE_original(nn.Module):
             return output.real
          
         return output
-    
+
+
+class FiLMBlock(nn.Module):
+    """Feature-wise Linear Modulation: gamma(z) * h + beta(z). Init so gamma≈1, beta≈0 (identity at start)."""
+    def __init__(self, z_dim: int, out_features: int, film_hidden: int = 64):
+        super().__init__()
+        self.gamma_net = nn.Sequential(
+            nn.Linear(z_dim, film_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(film_hidden, out_features),
+        )
+        self.beta_net = nn.Sequential(
+            nn.Linear(z_dim, film_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(film_hidden, out_features),
+        )
+        nn.init.zeros_(self.gamma_net[-1].weight)
+        nn.init.zeros_(self.gamma_net[-1].bias)
+        nn.init.zeros_(self.beta_net[-1].weight)
+        nn.init.zeros_(self.beta_net[-1].bias)
+
+    def forward(self, z):
+        # (1 + gamma) * h + beta so at init (gamma=0, beta=0) we get identity
+        gamma = self.gamma_net(z)
+        beta = self.beta_net(z)
+        return gamma, beta
+
+
 class ConditionalWIRE(nn.Module):
     '''
     Since complex numbers don't work with jacrev, we need to use the real number version of the WIRE.
@@ -207,6 +234,10 @@ class ConditionalWIRE(nn.Module):
                  hypernet_hidden=(32, 32),
                  lora_init_scale=0.01,
                  dropout_p=0.0,
+                 use_film=False,
+                 film_after_layers=(0, 2),
+                 film_hidden=64,
+                 nz=None,
                  **kwargs):
         super().__init__()
         self.layers = layers
@@ -226,6 +257,8 @@ class ConditionalWIRE(nn.Module):
         self.n_norm_col_end = (n_norm_col + len(self.n_studs_values)) if self.use_smooth_n_encoding else None
         self.use_hypernet = use_hypernet
         self.c_dim = c_dim
+        self.use_film = bool(use_film)
+        self._film_after_indices = tuple(film_after_layers) if use_film else ()
 
         # All results in the paper were with the default complex 'gabor' nonlinearity
         # NOTE: I used partial(RelGaborLayer, omega0=first_omega_0, sigma0=scale) to set the default values, but there was some weird behavior. 
@@ -260,6 +293,20 @@ class ConditionalWIRE(nn.Module):
             self.net.append(nn.Sigmoid())
         
         self.net = nn.Sequential(*self.net)
+
+        # Optional: FiLM re-injection of z at selected layers so conditioning is not washed out
+        if self.use_film:
+            z_dim = int(nz) if nz is not None else layers[0]
+            hidden_dim = layers[1]
+            self.film_blocks = nn.ModuleList([
+                FiLMBlock(z_dim, hidden_dim, film_hidden)
+                for _ in self._film_after_indices
+            ])
+            # Indices in _backbone (for hypernet path): same logical positions (after 1st and 3rd Gabor)
+            self._film_backbone_indices = self._film_after_indices
+        else:
+            self.film_blocks = nn.ModuleList()
+            self._film_backbone_indices = ()
 
         # Optional: LoRA on last two layers (penult Gabor's Linear + final Linear) for more expressivity
         if use_hypernet:
@@ -326,7 +373,17 @@ class ConditionalWIRE(nn.Module):
             U1, V1 = lora_pairs[0]
             U2, V2 = lora_pairs[1]
 
-            h = self._backbone(xz)  # (B, 256)
+            if self.use_film:
+                h = xz
+                film_idx = 0
+                for i, m in enumerate(self._backbone):
+                    h = m(h)
+                    if i in self._film_backbone_indices:
+                        gamma, beta = self.film_blocks[film_idx](z)
+                        film_idx += 1
+                        h = (1 + gamma) * h + beta
+            else:
+                h = self._backbone(xz)  # (B, 256)
             # Penult Gabor with LoRA: base_freq + (U1@V1)@h per sample -> (B, 512)
             base_freq = self._penult_gabor.freq_scale(h)
             # Chunked to avoid OOM: (U1@V1) is (B, 512, 256); full batch can be 70k+ on 8GB GPU
@@ -344,7 +401,18 @@ class ConditionalWIRE(nn.Module):
                 output = output.squeeze(0)
             return output
 
-        output = self.net(xz)
+        if self.use_film:
+            h = xz
+            film_idx = 0
+            for i, m in enumerate(self.net):
+                h = m(h)
+                if i in self._film_after_indices:
+                    gamma, beta = self.film_blocks[film_idx](z)
+                    film_idx += 1
+                    h = (1 + gamma) * h + beta
+            output = h
+        else:
+            output = self.net(xz)
         if unbatched:
             output = output.squeeze(0)
         return output

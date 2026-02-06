@@ -115,6 +115,69 @@ def loss_unseen_violation(z, netp, unseen_problems, _build_z_for_n, n_z_samples,
 
 
 # =============================================================================
+# LATENT INTERPOLATION MIDPOINT LOSS
+# Purpose: Encourage valid, smooth decoding at the midpoint between two brick types
+#          (e.g. z_mid between 1x2 and 1x4 → 1x3-like). Different brick types only.
+# How: Build z1, z2 for two different N; z_mid = (z1+z2)/2. Sample x in domain,
+#      keep points near zero-level set of z_mid (|f - level_set| < threshold).
+#      At those x: (A) eikonal (||∇_x f|| - 1)², (B) penalize ||∇_z f|| (smooth in z).
+# Use: lambda_interp_midpoint > 0; requires condition_on_n_studs and ≥2 n_studs_values.
+# =============================================================================
+def loss_interp_midpoint(z, netp, p_sampler, _build_z_for_n, n_studs_values, level_set, nf_is_density,
+                        interp_near_threshold, interp_n_domain_calls, interp_min_near_points,
+                        scale_interp_eikonal, scale_interp_smooth_z, **kwargs) -> Scalar:
+    """
+    Eikonal + smooth-z at midpoint between two different brick-type latents.
+    Samples x near zero-level set of f(·, z_mid), then applies eikonal and ∇_z penalty.
+    """
+    if not callable(_build_z_for_n) or not n_studs_values or len(n_studs_values) < 2:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    device = z.device
+    dtype = z.dtype
+    N1, N2 = n_studs_values[0], n_studs_values[-1]
+    if N1 == N2:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+
+    # Different brick types: build z1, z2 and midpoint
+    z1 = _build_z_for_n(N1, 1, device)   # (1, nz)
+    z2 = _build_z_for_n(N2, 1, device)   # (1, nz)
+    z_mid = (z1 + z2) / 2.0              # (1, nz)
+
+    # Sample domain points (multiple calls for more points)
+    xs = []
+    for _ in range(max(1, int(interp_n_domain_calls))):
+        xs.append(p_sampler.sample_from_domain())
+    x = torch.cat(xs, dim=0)   # (M, 3)
+
+    # Forward at z_mid to find near zero-level set
+    x_tp, z_tp = tensor_product_xz(x, z_mid)
+    y = netp.grouped_no_grad_fwd('vf', x_tp, z_tp).squeeze(-1)   # (M,)
+    near = (y - level_set).abs() < interp_near_threshold
+
+    n_near = near.sum().item()
+    if n_near < interp_min_near_points:
+        x_use = x
+        z_use = z_mid.expand(x.shape[0], -1)
+    else:
+        x_use = x[near]
+        z_use = z_mid.expand(x_use.shape[0], -1)
+
+    if x_use.shape[0] == 0:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+
+    # (A) Eikonal at x_use, z_use
+    y_x = netp.grouped_fwd('vf_x', x_use, z_use)
+    loss_eik = eikonal_loss(y_x)
+
+    # (B) Smooth w.r.t. z: penalize ||∇_z f||
+    y_z = netp.vf_z(x_use, z_use).squeeze(-1)
+    loss_z = y_z.square().mean()
+
+    loss = scale_interp_eikonal * loss_eik + scale_interp_smooth_z * loss_z
+    return loss
+
+
+# =============================================================================
 # CUBOID PRIMITIVE LOSS (RULE-BASED)
 # Purpose: Teach the network what a box IS, not memorize specific surfaces
 # How: 
