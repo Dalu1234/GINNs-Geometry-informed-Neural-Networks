@@ -92,6 +92,7 @@ def save_model_every_n_epochs(model, optim, sched, config, epoch, conditional_pr
     ## save model
     model_filename = name_stem + '-model.pt'
     model_path = os.path.join(model_parent_path, model_filename)
+    Path(model_parent_path).mkdir(parents=True, exist_ok=True)  # ensure dir exists (e.g. path/to/dir was placeholder)
     # torch.save(model.state_dict(), model_path)
     ModelFactory.save(model, model_path)
 

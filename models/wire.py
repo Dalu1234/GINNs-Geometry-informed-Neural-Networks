@@ -178,6 +178,26 @@ class WIRE_original(nn.Module):
         return output
 
 
+class CondEncoder(nn.Module):
+    """Maps scalar n_norm in [0,1] to a learned conditioning vector. Outputs out_dim + 1: first out_dim
+    go to the backbone; last dim is used only for dist_to_edge (sigmoid in model) so the decoder
+    cannot shortcut on raw n_norm."""
+    def __init__(self, in_dim=1, out_dim=8, hidden=32):
+        super().__init__()
+        self.out_dim = out_dim  # number of dims for backbone; total output is out_dim + 1
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim + 1),
+        )
+
+    def forward(self, n_norm):
+        # n_norm: (batch,) or (batch, 1)
+        if n_norm.dim() == 1:
+            n_norm = n_norm.unsqueeze(-1)
+        return self.net(n_norm)  # (batch, out_dim+1)
+
+
 class FiLMBlock(nn.Module):
     """Feature-wise Linear Modulation: gamma(z) * h + beta(z). Init so gamma≈1, beta≈0 (identity at start)."""
     def __init__(self, z_dim: int, out_features: int, film_hidden: int = 64):
@@ -237,6 +257,8 @@ class ConditionalWIRE(nn.Module):
                  use_film=False,
                  film_after_layers=(0, 2),
                  film_hidden=64,
+                 use_n_encoder=False,
+                 n_encoder_dim=8,
                  nz=None,
                  **kwargs):
         super().__init__()
@@ -255,6 +277,12 @@ class ConditionalWIRE(nn.Module):
         self.n_norm_col = n_norm_col
         self.use_smooth_n_encoding = use_smooth_n_encoding and len(self.n_studs_values) > 0
         self.n_norm_col_end = (n_norm_col + len(self.n_studs_values)) if self.use_smooth_n_encoding else None
+        self.use_n_encoder = bool(use_n_encoder) and not self.use_smooth_n_encoding and len(self.n_studs_values) > 0
+        self.n_encoder_dim = int(n_encoder_dim) if self.use_n_encoder else 0
+        if self.use_n_encoder:
+            self.n_encoder = CondEncoder(1, self.n_encoder_dim, hidden=32)
+        else:
+            self.n_encoder = None
         self.use_hypernet = use_hypernet
         self.c_dim = c_dim
         self.use_film = bool(use_film)
@@ -331,6 +359,12 @@ class ConditionalWIRE(nn.Module):
                 init_scale=lora_init_scale,
             )
 
+    def encode_n(self, n_norm):
+        """Map scalar n_norm (batch, 1) or (batch,) to (batch, n_encoder_dim). Only valid when use_n_encoder."""
+        if self.n_encoder is None:
+            raise RuntimeError("encode_n only valid when use_n_encoder=True")
+        return self.n_encoder(n_norm)
+
     # Chunk size for LoRA bmm to avoid OOM when batch is large (e.g. tensor_product_xz with 70k+ rows)
     LORA_BMM_CHUNK = 4096
 
@@ -354,21 +388,31 @@ class ConditionalWIRE(nn.Module):
         if unbatched:
             x = x.unsqueeze(0)
             z = z.unsqueeze(0)
+        # When use_n_encoder, z has an extra column (9th): use it only for dist_to_edge, not for backbone (no shortcut)
+        if self.use_n_encoder and z.shape[-1] > 0 and self.n_norm_col < z.shape[-1]:
+            n_norm_for_dist = torch.sigmoid(z[:, self.n_norm_col])
+            z_backbone = torch.cat([z[:, :self.n_norm_col], z[:, self.n_norm_col + 1:]], dim=-1)
+        else:
+            z_backbone = z
+            n_norm_for_dist = None
         if self.use_dist_to_edge:
             from util.model_utils import dist_to_edge_x_from_z
-            dist_x = dist_to_edge_x_from_z(x, z, self.n_studs_values, self.n_norm_col, n_norm_col_end=self.n_norm_col_end)
+            if n_norm_for_dist is not None:
+                dist_x = dist_to_edge_x_from_z(x, z, self.n_studs_values, self.n_norm_col, n_norm_col_end=self.n_norm_col_end, n_norm_override=n_norm_for_dist)
+            else:
+                dist_x = dist_to_edge_x_from_z(x, z, self.n_studs_values, self.n_norm_col, n_norm_col_end=self.n_norm_col_end)
             x = torch.cat([x, dist_x.unsqueeze(-1)], dim=-1)
         if self.use_tiled_coords:
             from util.model_utils import tile_coords_xy
             x = tile_coords_xy(x, period_x=self.stud_spacing_x, period_y=self.stud_spacing_y, center=True)
-        xz = torch.cat([x, z], dim=-1)
+        xz = torch.cat([x, z_backbone], dim=-1)
 
         if self.use_hypernet:
             # Contract: last c_dim columns of z must be (Nx_norm, Ny_norm, height_norm)
-            assert z.shape[-1] >= self.c_dim, (
-                f"use_hypernet with c_dim={self.c_dim} requires z to have at least {self.c_dim} columns; got z.shape[-1]={z.shape[-1]}"
+            assert z_backbone.shape[-1] >= self.c_dim, (
+                f"use_hypernet with c_dim={self.c_dim} requires z to have at least {self.c_dim} columns; got z.shape[-1]={z_backbone.shape[-1]}"
             )
-            c = z[:, -self.c_dim:].clamp(0.0, 1.0)
+            c = z_backbone[:, -self.c_dim:].clamp(0.0, 1.0)
             lora_pairs = self.hypernet(c)  # list of (U, V) for penult and final
             U1, V1 = lora_pairs[0]
             U2, V2 = lora_pairs[1]
@@ -379,7 +423,7 @@ class ConditionalWIRE(nn.Module):
                 for i, m in enumerate(self._backbone):
                     h = m(h)
                     if i in self._film_backbone_indices:
-                        gamma, beta = self.film_blocks[film_idx](z)
+                        gamma, beta = self.film_blocks[film_idx](z_backbone)
                         film_idx += 1
                         h = (1 + gamma) * h + beta
             else:
@@ -407,7 +451,7 @@ class ConditionalWIRE(nn.Module):
             for i, m in enumerate(self.net):
                 h = m(h)
                 if i in self._film_after_indices:
-                    gamma, beta = self.film_blocks[film_idx](z)
+                    gamma, beta = self.film_blocks[film_idx](z_backbone)
                     film_idx += 1
                     h = (1 + gamma) * h + beta
             output = h

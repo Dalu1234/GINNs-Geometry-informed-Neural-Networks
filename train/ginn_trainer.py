@@ -66,9 +66,18 @@ class Trainer():
             self.logger.info(f'n_studs_values (brick types): {self.n_studs_values}')
             self.use_smooth_n_encoding = config.get('use_smooth_n_encoding', False)
             self.smooth_n_sigma = config.get('smooth_n_sigma', 1.0)
+            self.use_n_encoder = config.get('use_n_encoder', False)
+            self.n_encoder_dim = config.get('n_encoder_dim', 8)
             if self.use_smooth_n_encoding:
                 model_kw['nz'] = model_kw['nz'] + len(self.n_studs_values)  # one dim per support N
                 model_kw['use_smooth_n_encoding'] = True
+            elif self.use_n_encoder:
+                # MLP encoder: outputs n_encoder_dim+1 (8 for backbone, 1 for dist_to_edge only — no raw n_norm so decoder cannot shortcut)
+                model_kw['nz'] = model_kw['nz'] + self.n_encoder_dim  # backbone sees only 8 dims
+                model_kw['use_n_encoder'] = True
+                model_kw['n_encoder_dim'] = self.n_encoder_dim
+                nz_base = config.get('latent_sampling', {}).get('nz', 6)
+                model_kw['n_norm_col'] = nz_base + self.n_encoder_dim  # 9th encoded dim (index 8) used only for dist_to_edge
             else:
                 model_kw['nz'] = model_kw['nz'] + 1  # shape latent + 1 for N
         if self.condition_on_n_studs_y:
@@ -227,7 +236,12 @@ class Trainer():
         if self.config.get('lambda_prior', 0) > 0 and (self.condition_on_n_studs or self.condition_on_n_studs_y or self.condition_on_height):
             from train.train_utils.conditional_prior import ConditionalPrior
             self.nz_base_prior = self.config['latent_sampling']['nz']
-            n_dim = (len(self.n_studs_values) if (self.condition_on_n_studs and getattr(self, 'use_smooth_n_encoding', False)) else (1 if self.condition_on_n_studs else 0))
+            if self.condition_on_n_studs and getattr(self, 'use_smooth_n_encoding', False):
+                n_dim = len(self.n_studs_values)
+            elif self.condition_on_n_studs and getattr(self, 'use_n_encoder', False):
+                n_dim = self.n_encoder_dim + 1  # 9 encoded dims (8 backbone + 1 for dist_to_edge)
+            else:
+                n_dim = (1 if self.condition_on_n_studs else 0)
             self.c_dim_prior = n_dim + (1 if self.condition_on_n_studs_y else 0) + (1 if self.condition_on_height else 0)
             prior_hidden = self.config.get('prior_hidden', [32, 32])
             self.conditional_prior = ConditionalPrior(
@@ -290,6 +304,11 @@ class Trainer():
             if getattr(self, 'use_smooth_n_encoding', False):
                 w = encode_n_gaussian(N, self.n_studs_values, sigma=self.smooth_n_sigma, device=device, dtype=z_base.dtype)
                 cols.append(w.unsqueeze(0).expand(n_samples, -1))
+            elif getattr(self, 'use_n_encoder', False):
+                n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                n_norm = (N - n_min) / max(n_max - n_min, 1)
+                n_norm_t = torch.full((n_samples, 1), n_norm, device=device, dtype=z_base.dtype)
+                cols.append(self.model.encode_n(n_norm_t))  # 9 dims: 8 for backbone, 9th for dist_to_edge only (no raw)
             else:
                 n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
                 n_norm = (N - n_min) / max(n_max - n_min, 1)
@@ -356,6 +375,13 @@ class Trainer():
                     ]
                     n_col = torch.stack(n_weights_list, dim=0)  # (batch, len(n_studs_values))
                     cols.append(n_col)
+                elif getattr(self, 'use_n_encoder', False):
+                    n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                    n_norms = torch.tensor(
+                        [(self.n_studs_values[i % len(self.n_studs_values)] - n_min) / max(n_max - n_min, 1) for i in range(z_val.shape[0])],
+                        device=z_val.device, dtype=z_val.dtype
+                    ).unsqueeze(1)  # (n_val, 1)
+                    cols.append(self.model.encode_n(n_norms))  # (n_val, 9)
                 else:
                     n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
                     n_col = torch.tensor(
@@ -505,6 +531,11 @@ class Trainer():
                         w = encode_n_gaussian(N, self.n_studs_values, sigma=self.smooth_n_sigma, device=z_bases.device, dtype=z_bases.dtype)
                         n_col = w.unsqueeze(0).expand(z_bases.shape[0], -1)
                         cols.append(n_col)
+                    elif getattr(self, 'use_n_encoder', False):
+                        n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                        n_norm = (N - n_min) / max(n_max - n_min, 1)
+                        n_norm_t = torch.full((z_bases.shape[0], 1), n_norm, device=z_bases.device, dtype=z_bases.dtype)
+                        cols.append(self.model.encode_n(n_norm_t))  # 9 dims only; no raw n_norm
                     else:
                         n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
                         n_norm = (N - n_min) / max(n_max - n_min, 1)
@@ -554,6 +585,11 @@ class Trainer():
                             w = encode_n_gaussian(N, self.n_studs_values, sigma=self.smooth_n_sigma, device=z.device, dtype=z.dtype)  # (len(n_studs_values),)
                             n_col = w.unsqueeze(0).expand(z.shape[0], -1)  # (batch, len(n_studs_values))
                             cols.append(n_col)
+                        elif getattr(self, 'use_n_encoder', False):
+                            n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
+                            n_norm = (N - n_min) / max(n_max - n_min, 1)
+                            n_norm_t = torch.full((z.shape[0], 1), n_norm, device=z.device, dtype=z.dtype)
+                            cols.append(self.model.encode_n(n_norm_t))  # 9 dims only; no raw n_norm
                         else:
                             n_min, n_max = min(self.n_studs_values), max(self.n_studs_values)
                             n_norm = (N - n_min) / max(n_max - n_min, 1)
@@ -616,7 +652,7 @@ class Trainer():
                 if mesh_or_contour is not None:
                     self.mpm.metrics(self.meter.get_average_metrics_as_dict, arg_list=[mesh_or_contour], kwargs_dict={'prefix': 'm_train_'})
                 
-                if self.config['lambda_data'] > 0:
+                if self.config['lambda_data'] > 0 and z_corners.shape[0] > 0 and z_corners.shape[1] == z.shape[1]:
                     mesh_or_contour = self.problem.get_mesh_or_contour(self.netp.f_, self.netp.params, z_corners)
                     if mesh_or_contour is not None:
                         self.mpm.metrics(self.meter.get_average_metrics_as_dict, arg_list=[mesh_or_contour], kwargs_dict={'prefix': 'm_corners_'})
@@ -758,7 +794,9 @@ class Trainer():
                       problem=self.problem, bounds=getattr(self.problem, 'bounds', None),
                       bounds_body=getattr(self.problem, 'bounds_body', None),
                       n_outside_per_stud=self.config.get('stud_grid_n_outside', 50),
-                      stud_shell_thickness=self.config.get('stud_grid_shell_thickness', 0.05))
+                      stud_shell_thickness=self.config.get('stud_grid_shell_thickness', 0.05),
+                      n_norm_col=getattr(self.model, 'n_norm_col', 2),
+                      n_norm_col_end=getattr(self.model, 'n_norm_col_end', None))
         for key in self.scalar_loss_keys:
             if epoch < self.config.get('start_'+key.base_key, 0):
                 loss_dict[key] = torch.tensor(0.0)
@@ -859,8 +897,8 @@ class Trainer():
             # Outside-brick SDF: at points with dist_to_edge < -margin, push f > margin (positive SDF)
             'outside_brick_sdf': partial(loss_outside_brick_sdf, netp=self.netp, p_sampler=self.problem,
                                         n_studs_values=getattr(self, 'n_studs_values', self.config.get('n_studs_values', [2, 3])),
-                                        n_norm_col=2,
-                                        n_norm_col_end=(2 + len(getattr(self, 'n_studs_values', []))) if getattr(self, 'use_smooth_n_encoding', False) else None,
+                                        n_norm_col=getattr(self.model, 'n_norm_col', 2),
+                                        n_norm_col_end=getattr(self.model, 'n_norm_col_end', None),
                                         margin=self.config.get('outside_brick_sdf_margin', 0.1),
                                         n_samples=self.config.get('outside_brick_sdf_n_samples', 500)),
             # Unseen-N violation: penalize interface+envelope on unseen N (e.g. 3, 6, 7) for generalization

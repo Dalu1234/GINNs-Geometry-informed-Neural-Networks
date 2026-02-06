@@ -598,6 +598,25 @@ def loss_prior(z, conditional_prior, nz_base, c_dim, **kwargs) -> Scalar:
 
 
 # =============================================================================
+# N-ENCODER AUXILIARY LOSS (when use_n_encoder=True)
+# Purpose: Keep the 9th encoder dim (used only for dist_to_edge via n_norm_override) near the true n_norm.
+# How: MSE(sigmoid(z[:, n_norm_col]), n_norm_target) so dist_to_edge gets a sensible "n" from the start.
+# Use: Stable geometry, faster training, interpretability, avoids 9th-dim collapse. Optional warm start.
+# =============================================================================
+def loss_n_encoder_aux(z, n_norm_col, n_norm_target=None, **kwargs) -> Scalar:
+    """
+    Auxiliary loss: encourage the 9th encoder dimension to stay close to the true normalized stud count.
+    The 9th dim is used only as n_norm_override in dist_to_edge; the backbone never sees it.
+    When n_norm_target is None (e.g. non-LEGO or no conditioning), returns 0.
+    """
+    if n_norm_target is None or z.shape[1] <= n_norm_col:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    z_9 = z[:, n_norm_col]
+    target = torch.full_like(z_9, n_norm_target, device=z.device, dtype=z.dtype)
+    return F.mse_loss(torch.sigmoid(z_9), target)
+
+
+# =============================================================================
 # SCC LOSS (Single Connected Component)
 # Purpose: Ensure shape is ONE piece, not fragmented blobs
 # How: Uses persistent homology (PH) to count connected components

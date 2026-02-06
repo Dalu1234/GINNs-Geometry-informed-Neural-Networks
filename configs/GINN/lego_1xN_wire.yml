@@ -13,10 +13,13 @@ vars:
   ginn_on: 1
   # Conditioning on N (number of studs): one model for 1x2, 1x3, 1x4, 1x6 etc.
   condition_on_n_studs: true
-  n_studs_values: [1,2,4,5]  # N studs: 2 → 1x2 only
+  n_studs_values: [1,2,4,5,6,7,8,9,12,15]  # N studs: 2 → 1x2 only
   # Smooth N encoding: Gaussian blend over n_studs_values so unseen N (e.g. 7) is blend of 6,8
   use_smooth_n_encoding: false    # false = single scalar n_norm; true = vector of Gaussian weights
   smooth_n_sigma: 1.0            # sigma for Gaussian blend (only when use_smooth_n_encoding)
+  # N MLP encoder: map n_norm (1 scalar) -> n_encoder_dim (e.g. 8) for richer conditioning; default off for compatibility
+  use_n_encoder: true
+  n_encoder_dim: 8
   # Conditioning on NxN (second dimension): 1 = 1xN, 2+ = NxM grid
   condition_on_n_studs_y: true
   n_studs_y_values: [1]   # 1 = 1xN only → no 2x2, 4x4
@@ -27,7 +30,7 @@ vars:
   nf_is_density: false
   level_set: 0.0
   # Unseen-N evaluation: every K epochs compute metric on fixed unseen N (e.g. 3, 6, 7) for generalization monitoring
-  unseen_n_studs: [3, 6, 7, 10 ,13]   # N not in n_studs_values; set [] to disable
+  unseen_n_studs: []   # N not in n_studs_values; set [] to disable
   unseen_eval_every_n_epochs: 50
   unseen_violation_every_n_epochs: 10  # run unseen_violation loss every N epochs (saves cost; omit to run every step)
   unseen_eval_metric: 'violation'   # 'violation' = mean interface+envelope loss; 'chamfer' = mean Chamfer to rule mesh (if implemented)
@@ -44,6 +47,8 @@ condition_on_n_studs: ${vars.condition_on_n_studs}
 n_studs_values: ${vars.n_studs_values}
 use_smooth_n_encoding: ${vars.use_smooth_n_encoding}
 smooth_n_sigma: ${vars.smooth_n_sigma}
+use_n_encoder: ${vars.use_n_encoder}
+n_encoder_dim: ${vars.n_encoder_dim}
 condition_on_n_studs_y: ${vars.condition_on_n_studs_y}
 n_studs_y_values: ${vars.n_studs_y_values}
 condition_on_height: ${vars.condition_on_height}
@@ -69,6 +74,8 @@ model:
   # Distance to brick edge: append signed dist_to_edge_x (positive inside, negative outside) so the network can ignore phantom studs
   use_dist_to_edge: true
   n_studs_values: ${n_studs_values}   # required for dist_to_edge; z column index for n is n_norm_col (default 2)
+  use_n_encoder: ${use_n_encoder}
+  n_encoder_dim: ${n_encoder_dim}
   # Hypernetwork LoRA: per-brick low-rank deltas on last TWO layers (penult Gabor + final linear) for more expressivity
   use_hypernet: false
   lora_rank: 16   # was 4; higher rank = more directions to express 1x2 vs 1x4
@@ -134,14 +141,14 @@ lambda_phantom_stud: ${eval:${vars.ginn_on} * 0.5}    # rule-enforcement: penali
 lambda_outside_brick_sdf: ${eval:${vars.ginn_on} * 0.3}   # outside brick (dist_to_edge < -margin) → push SDF > margin
 lambda_prior: ${eval:${vars.ginn_on} * 0.01}   # small: train prior so sample_z_from_prior_prob can sample z ~ p(z|c)
 lambda_latent_structure: ${eval:${vars.ginn_on} * 0.01}   # prevent collapse, cap magnitude, encourage diversity
-lambda_unseen_violation: 1   # penalize poor constraint satisfaction on unseen N (e.g. 3, 6, 7); set > 0 to enable
-# Interpolation midpoint loss: eikonal + smooth-z at z_mid between two brick types; sample near zero-level set
-lambda_interp_midpoint: 0.3    # set > 0 to enable (e.g. 0.1); encourages valid/smooth decoding at 1x3-like z
-interp_near_threshold: 0.1     # keep x where |f(x,z_mid) - level_set| < this (near zero-level set)
-interp_n_domain_calls: 2       # number of domain samples to concat (more → better near-surface coverage)
-interp_min_near_points: 32    # if fewer points pass near filter, use all domain points
-scale_interp_eikonal: 1.0     # weight for eikonal term at z_mid
-scale_interp_smooth_z: 0.1    # weight for ||∇_z f|| penalty (smooth interpolation in z)
+# Unseen N + interpolation losses (all optional; set lambda_* > 0 to enable)
+lambda_unseen_violation: 0     # penalize poor constraint satisfaction on unseen N (e.g. 3, 6, 7); off
+lambda_interp_midpoint: 0     # eikonal + smooth-z at z_mid between brick types; off
+interp_near_threshold: 0.1     # used only when lambda_interp_midpoint > 0
+interp_n_domain_calls: 2
+interp_min_near_points: 32
+scale_interp_eikonal: 1.0
+scale_interp_smooth_z: 0.1
 sample_z_from_prior_prob: 0.3   # 30% of batches: sample z_base from prior (only when lambda_prior > 0)
 prior_hidden: [32, 32]
 prior_min_sigma: 1.0e-3
@@ -335,12 +342,12 @@ overwrite_existing_saved_model: true   # overwrite same files in run dir (one mo
 save_optimizer: true
 
 ## Weight loading (train from scratch = no load; resume = set load_* true and model_load_path)
-load_mos: true   # true = load model + optimizer + scheduler from path
-load_model: true
-load_optimizer: true
-load_scheduler: true
+load_mos: false   # true = load model + optimizer + scheduler from path
+load_model: false
+load_optimizer: false
+load_scheduler: false
 #model_load_path: 'path/to/dir/cond_wire/2026_02_04__20_31_09-tiy5hqdl/2026_02_04__20_31_09-tiy5hqdl-model.pt'
 #model_load_path: 'path/to/dir/cond_wire/2026_02_05__02_02_38-3k34l224/2026_02_05__02_02_38-3k34l224-model.pt'
-model_load_latest: true  # find latest *-model.pt under model_save_path/model_str
+model_load_latest: false  # find latest *-model.pt under model_save_path/model_str
 resume_same_run_dir: false  # false = new folder for this run; true = save into loaded run dir
 # model_load_wandb_id: 'mb8z12t1'

@@ -134,10 +134,10 @@ class LatentSampler:
 
     def combine_z_with_z_corners(self, z, z_corners, n_train_shapes_to_plot):
         z_plot = z[:n_train_shapes_to_plot]
-        if len(z_corners) > 0:
-            # sub-sample z
+        if len(z_corners) > 0 and z_corners.shape[1] == z.shape[1]:
+            # sub-sample z (only mix when same latent dim, e.g. conditioning adds cols to z but not to z_corners)
             z_sub = z[:n_train_shapes_to_plot - len(z_corners)]
-            z_plot = torch.cat([z_corners[:1], z_sub, z_corners[1:]], dim=0) # works if there are 1 or 2 data shapes in the corners
+            z_plot = torch.cat([z_corners[:1], z_sub, z_corners[1:]], dim=0)  # works if there are 1 or 2 data shapes in the corners
         return z_plot
 
 # helper for visualization

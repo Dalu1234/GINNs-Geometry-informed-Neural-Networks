@@ -39,7 +39,7 @@ def tile_coords_xy(x, period_x=1.0, period_y=1.0, center=True):
         return np.concatenate([x, x_tile[..., None], y_tile[..., None]], axis=-1)
 
 
-def dist_to_edge_x_from_z(x, z, n_studs_values, n_norm_col=2, n_norm_col_end=None):
+def dist_to_edge_x_from_z(x, z, n_studs_values, n_norm_col=2, n_norm_col_end=None, n_norm_override=None):
     """
     Signed distance to nearest x-boundary of the brick (positive inside, negative outside).
     Decodes brick type from z and uses normalized LEGO formula: half_length_x = (n_studs - 0.025) / 2.
@@ -48,11 +48,14 @@ def dist_to_edge_x_from_z(x, z, n_studs_values, n_norm_col=2, n_norm_col_end=Non
     z: [B, nz] or [nz]. N conditioning: either single column n_norm in [0,1], or Gaussian weights in z[:, n_norm_col:n_norm_col_end].
     n_studs_values: list of N values (e.g. [2, 3, 4, 6]).
     n_norm_col_end: if set and > n_norm_col+1, z[:, n_norm_col:n_norm_col_end] is weight vector over n_studs_values; n_eff = sum(weights * support).
+    n_norm_override: optional [B] or scalar; when set (e.g. encoder 9th dim), use instead of z[:, n_norm_col] so decoder does not see raw n_norm.
 
     Returns:
         dist_to_edge_x: [B] or scalar signed distance (positive inside brick).
     """
     support = torch.tensor(n_studs_values, device=z.device, dtype=z.dtype)
+    n_min = min(n_studs_values)
+    n_max = max(n_studs_values)
     nz = z.shape[-1]
     use_smooth = (
         n_norm_col_end is not None
@@ -60,12 +63,13 @@ def dist_to_edge_x_from_z(x, z, n_studs_values, n_norm_col=2, n_norm_col_end=Non
         and nz >= n_norm_col_end
     )
     if z.dim() == 1:
-        if use_smooth:
+        if n_norm_override is not None:
+            n_norm_val = n_norm_override.flatten()[0].clamp(0.0, 1.0).item() if isinstance(n_norm_override, torch.Tensor) else max(0.0, min(1.0, float(n_norm_override)))
+            n_eff = n_min + n_norm_val * (n_max - n_min)
+        elif use_smooth:
             w = z[n_norm_col:n_norm_col_end]
             n_eff = (w * support).sum()
         else:
-            n_min = min(n_studs_values)
-            n_max = max(n_studs_values)
             n_norm = z[n_norm_col].clamp(0.0, 1.0)
             n_eff = n_min + n_norm * (n_max - n_min)
         half_length_x = (n_eff - 0.025) / 2.0
@@ -75,12 +79,14 @@ def dist_to_edge_x_from_z(x, z, n_studs_values, n_norm_col=2, n_norm_col_end=Non
             half_length_x - x_coord
         )
     else:
-        if use_smooth:
+        if n_norm_override is not None:
+            n_norm = n_norm_override.flatten() if n_norm_override.dim() > 1 else n_norm_override
+            n_norm = n_norm.to(z.device).to(z.dtype).clamp(0.0, 1.0)
+            n_eff = n_min + n_norm * (n_max - n_min)
+        elif use_smooth:
             w = z[:, n_norm_col:n_norm_col_end]  # (B, len(support))
             n_eff = (w * support.unsqueeze(0)).sum(dim=1)  # (B,)
         else:
-            n_min = min(n_studs_values)
-            n_max = max(n_studs_values)
             n_norm = z[:, n_norm_col].clamp(0.0, 1.0)
             n_eff = n_min + n_norm * (n_max - n_min)
         half_length_x = (n_eff - 0.025) / 2.0
